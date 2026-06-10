@@ -1,18 +1,6 @@
 <div align="center">
 
-<!-- SVG Logo -->
-<svg width="140" height="140" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
-  <rect width="140" height="140" rx="24" fill="#0a0a14"/>
-  <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
-  <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
-  <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
-  <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
-  <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
-  <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
-  <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
-  <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
-  <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
+<img src="./logo.svg" alt="yaml-validator logo" width="140">
 
 # yaml-validator
 
