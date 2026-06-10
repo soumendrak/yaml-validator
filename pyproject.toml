@@ -1,0 +1,33 @@
+[project]
+name = "yaml-validator"
+version = "0.1.0"
+description = "Validate YAML files for syntax, style, and schema correctness."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Soumendra Kumar Sahoo", email = "soumendra.s@outlook.com" },
+]
+requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0,<7.0",
+]
+
+[project.optional-dependencies]
+schema = ["jsonschema>=4.20,<5.0"]
+
+[project.urls]
+Homepage = "https://github.com/soumendrak/yaml-validator"
+Repository = "https://github.com/soumendrak/yaml-validator"
+
+[project.scripts]
+yaml-validator = "yaml_validator.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["yaml_validator*"]
+
+[tool.setuptools.package-data]
+yaml_validator = ["py.typed"]

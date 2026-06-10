@@ -1,0 +1,9 @@
+# YAML Validator - Core dependencies
+# Install via: uv pip install -r requirements.txt
+PyYAML>=6.0,<7.0
+
+# Schema validation (optional — for --schema flag)
+jsonschema>=4.20,<5.0
+
+# CLI
+click>=8.1,<9.0
