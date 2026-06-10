@@ -386,6 +386,10 @@ function validate() {
       warnings.push({ msg: 'Tab character found (use spaces instead)', line: i + 1, rule: 'no-tabs' });
   });
   lines.forEach((line, i) => {
+    if (line.length > 0 && line[0] === ' ' && line[1] !== ' ' && line.trim() && !line.trim().startsWith('#'))
+      warnings.push({ msg: 'Line starts with single space (likely copy-paste typo)', line: i + 1, rule: 'leading-space' });
+  });
+  lines.forEach((line, i) => {
     if (line !== line.trimEnd() && line.trim())
       warnings.push({ msg: 'Trailing whitespace', line: i + 1, rule: 'trailing-spaces' });
   });
@@ -484,9 +488,20 @@ function autoFix() {
   let result = text.replace(/\t/g, '  ');
   if (result !== text) fixed = true;
 
-  // 2. Trim trailing whitespace per line
+  // 2. Strip accidental leading single-space (common copy-paste typo).
+  //    Valid YAML never uses exactly 1 space for indentation.
   const lines = result.split('\n');
-  const trimmedLines = lines.map((line) => {
+  const fixedLines = lines.map((line) => {
+    if (line.length > 0 && line[0] === ' ' && line[1] !== ' ' && line.trim()) {
+      fixed = true;
+      return line.slice(1);
+    }
+    return line;
+  });
+  result = fixedLines.join('\n');
+
+  // 3. Trim trailing whitespace per line
+  const trimmedLines = result.split('\n').map((line) => {
     const trimmed = line.trimEnd();
     if (trimmed !== line && line.trim()) {
       fixed = true;
@@ -496,7 +511,7 @@ function autoFix() {
   });
   result = trimmedLines.join('\n');
 
-  // 3. Add trailing newline if missing
+  // 4. Add trailing newline if missing
   if (result.length > 0 && !result.endsWith('\n')) {
     result += '\n';
     fixed = true;
