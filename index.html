@@ -382,8 +382,8 @@ function validate() {
 
   // ── Style lint ──
   lines.forEach((line, i) => {
-    if (line.startsWith('\t') && line.trim())
-      warnings.push({ msg: 'Tab used for indentation (use spaces)', line: i + 1, rule: 'no-tabs' });
+    if (line.includes('\t') && line.trim())
+      warnings.push({ msg: 'Tab character found (use spaces instead)', line: i + 1, rule: 'no-tabs' });
   });
   lines.forEach((line, i) => {
     if (line !== line.trimEnd() && line.trim())
@@ -478,24 +478,15 @@ function autoFix() {
   const text = input.value;
   if (!text.trim()) return;
 
-  let lines = text.split('\n');
   let fixed = false;
 
-  // 1. Tabs → 2 spaces
-  const newLines = lines.map((line, i) => {
-    if (line.startsWith('\t') && line.trim()) {
-      fixed = true;
-      // Count leading tabs
-      const lead = line.match(/^\t+/);
-      const count = lead ? lead[0].length : 0;
-      return '  '.repeat(count) + line.slice(count);
-    }
-    return line;
-  });
-  lines = newLines;
+  // 1. Replace ALL tabs with 2 spaces (tabs are invalid in YAML everywhere)
+  let result = text.replace(/\t/g, '  ');
+  if (result !== text) fixed = true;
 
-  // 2. Trim trailing whitespace
-  lines = lines.map((line, i) => {
+  // 2. Trim trailing whitespace per line
+  const lines = result.split('\n');
+  const trimmedLines = lines.map((line) => {
     const trimmed = line.trimEnd();
     if (trimmed !== line && line.trim()) {
       fixed = true;
@@ -503,8 +494,7 @@ function autoFix() {
     }
     return line;
   });
-
-  let result = lines.join('\n');
+  result = trimmedLines.join('\n');
 
   // 3. Add trailing newline if missing
   if (result.length > 0 && !result.endsWith('\n')) {
@@ -519,7 +509,6 @@ function autoFix() {
     validate();
   } else {
     btnFix.disabled = true;
-    // Flash a message
     const old = badge.textContent;
     badge.textContent = 'Nothing to fix';
     badge.className = 'badge';
