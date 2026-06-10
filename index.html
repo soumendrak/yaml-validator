@@ -407,8 +407,8 @@ function validate() {
       multiDoc = true;
     } catch (e2) {
       errors.push({ msg: e1.message, rule: 'yaml-syntax' });
-      // Extract line number from js-yaml error
-      const lm = e1.message.match(/\bline\s+(\d+)/i);
+      // Extract line number from js-yaml error (two formats: "line N" or "(N:M)")
+      const lm = e1.message.match(/\bline\s+(\d+)/i) || e1.message.match(/\((\d+):\d+\)/);
       if (lm) errLines.add(parseInt(lm[1], 10));
     }
   }
