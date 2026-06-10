@@ -3,8 +3,9 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>yaml-validator — Validate YAML files</title>
-<meta name="description" content="Validate YAML files for syntax, style, and schema correctness. Python CLI tool with JSON Schema support.">
+<title>YAML Validator</title>
+<meta name="description" content="Paste YAML and validate syntax, style, and structure in your browser.">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js" integrity="sha384-+pxiN6T7yvpryuJmE1gM9PX7yQit15auDb+ZwwvJOd/4be2Cie5/IuVXgQb/S9du" crossorigin="anonymous"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -12,227 +13,441 @@
     color: #f0ece4;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
     line-height: 1.6;
-    display: flex;
-    flex-direction: column;
     min-height: 100vh;
   }
 
   .container {
-    max-width: 720px;
+    max-width: 960px;
     margin: 0 auto;
-    padding: 2rem 1.5rem;
-    flex: 1;
+    padding: 1.5rem;
   }
 
   header {
-    text-align: center;
-    padding: 3rem 0 2rem;
-  }
-
-  .logo {
-    margin-bottom: 1.5rem;
-  }
-  .logo svg {
-    width: 120px;
-    height: 120px;
-  }
-
-  h1 {
-    font-size: 2.5rem;
-    font-weight: 700;
-    color: #ff6b35;
-    letter-spacing: -0.02em;
-  }
-  .tagline {
-    font-size: 1.1rem;
-    color: #8a8a9a;
-    margin-top: 0.5rem;
-  }
-
-  .badges {
     display: flex;
-    gap: 0.5rem;
-    justify-content: center;
-    flex-wrap: wrap;
-    margin-top: 1rem;
-  }
-  .badges a {
-    display: inline-block;
-    padding: 0.25rem 0.75rem;
-    border-radius: 4px;
-    font-size: 0.8rem;
-    text-decoration: none;
-    color: #fff;
-    background: #1a1a2e;
-    border: 1px solid #2a2a3e;
-    transition: border-color 0.2s;
-  }
-  .badges a:hover { border-color: #ff6b35; }
-
-  section {
-    margin: 2.5rem 0;
-  }
-
-  h2 {
-    font-size: 1.3rem;
-    font-weight: 600;
-    color: #ff6b35;
-    margin-bottom: 1rem;
-    padding-bottom: 0.5rem;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.5rem;
+    padding-bottom: 1rem;
     border-bottom: 1px solid #1a1a2e;
   }
-
-  p { color: #c0c0d0; margin-bottom: 1rem; }
-
-  .feature-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 0.75rem;
+  header svg { flex-shrink: 0; }
+  header h1 {
+    font-size: 1.4rem;
+    font-weight: 600;
+    color: #ff6b35;
   }
-  @media (max-width: 500px) { .feature-grid { grid-template-columns: 1fr; } }
-  .feature-card {
-    background: #1a1a2e;
-    border-radius: 8px;
-    padding: 0.75rem 1rem;
-    border: 1px solid #2a2a3e;
-  }
-  .feature-card strong { color: #f0ece4; display: block; margin-bottom: 0.2rem; }
-  .feature-card span { color: #8a8a9a; font-size: 0.85rem; }
-
-  pre {
-    background: #111122;
-    border-radius: 8px;
-    padding: 1rem;
-    overflow-x: auto;
-    border: 1px solid #2a2a3e;
-    margin-bottom: 1rem;
+  header .sub {
     font-size: 0.85rem;
+    color: #8a8a9a;
   }
-  code {
-    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-    color: #ff6b35;
-  }
-  pre code { color: #c0c0d0; }
-  .cmd { color: #22c55e; }
-  .str { color: #e2b96f; }
-  .cmt { color: #5a5a7e; }
 
-  .install-box {
-    background: #1a1a2e;
+  .editor-row {
+    display: flex;
+    gap: 1rem;
+    align-items: flex-start;
+  }
+  @media (max-width: 700px) {
+    .editor-row { flex-direction: column; }
+  }
+
+  .input-panel {
+    flex: 1;
+    min-width: 0;
+  }
+
+  textarea {
+    width: 100%;
+    height: 400px;
+    background: #111122;
+    color: #f0ece4;
+    border: 1px solid #2a2a3e;
     border-radius: 8px;
     padding: 1rem;
-    border: 1px solid #2a2a3e;
-    text-align: center;
-    font-size: 1rem;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    resize: vertical;
+    outline: none;
+    transition: border-color 0.2s;
+    tab-size: 2;
   }
-  .install-box code {
-    color: #ff6b35;
-    background: #0a0a14;
-    padding: 0.15rem 0.5rem;
+  textarea:focus { border-color: #ff6b35; }
+  textarea::placeholder { color: #5a5a7e; }
+
+  .toolbar {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  button {
+    padding: 0.5rem 1.25rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background 0.2s, opacity 0.2s;
+  }
+  button:active { transform: scale(0.97); }
+
+  .btn-validate {
+    background: #ff6b35;
+    color: #0a0a14;
+  }
+  .btn-validate:hover { background: #ff8555; }
+
+  .btn-clear {
+    background: #1a1a2e;
+    color: #8a8a9a;
+    border: 1px solid #2a2a3e;
+  }
+  .btn-clear:hover { color: #f0ece4; border-color: #5a5a7e; }
+
+  .btn-example {
+    background: transparent;
+    color: #8a8a9a;
+    border: 1px dashed #2a2a3e;
+    font-size: 0.8rem;
+  }
+  .btn-example:hover { color: #ff6b35; border-color: #ff6b35; }
+
+  .status-badge {
+    margin-left: auto;
+    font-size: 0.8rem;
+    padding: 0.25rem 0.75rem;
     border-radius: 4px;
+    background: #1a1a2e;
+    color: #5a5a7e;
+  }
+  .status-badge.ok { background: #0a2a1a; color: #22c55e; border: 1px solid #22c55e; }
+  .status-badge.err { background: #2a0a0a; color: #ef4444; border: 1px solid #ef4444; }
+
+  .output-panel {
+    flex: 1;
+    min-width: 0;
+  }
+
+  #output {
+    background: #111122;
+    border: 1px solid #2a2a3e;
+    border-radius: 8px;
+    min-height: 400px;
+    max-height: 500px;
+    overflow-y: auto;
+    padding: 1rem;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.8rem;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  #output:empty::before {
+    content: 'Results will appear here after validation';
+    color: #5a5a7e;
+    font-style: italic;
+  }
+
+  .result-ok { color: #22c55e; font-weight: 600; }
+  .result-err { color: #ef4444; }
+  .result-warn { color: #e2b96f; }
+  .result-info { color: #8a8a9a; }
+  .result-line { color: #5a5a7e; }
+  .result-sep { border-top: 1px solid #2a2a3e; margin: 0.5rem 0; padding-top: 0.5rem; }
+  .result-heading { color: #ff6b35; font-weight: 600; margin-bottom: 0.25rem; }
+  .parsed-view {
+    background: #0a0a14;
+    border: 1px solid #1a1a2e;
+    border-radius: 6px;
+    padding: 0.75rem;
+    margin-top: 0.5rem;
+    max-height: 300px;
+    overflow: auto;
+    font-size: 0.78rem;
+  }
+  .parsed-view summary {
+    cursor: pointer;
+    color: #8a8a9a;
+    font-size: 0.8rem;
+    user-select: none;
+  }
+  .parsed-view summary:hover { color: #ff6b35; }
+
+  .char-count {
+    color: #5a5a7e;
+    font-size: 0.75rem;
   }
 
   footer {
     text-align: center;
-    padding: 2rem;
+    padding: 2rem 1rem 1rem;
     color: #5a5a7e;
-    font-size: 0.8rem;
+    font-size: 0.75rem;
   }
   footer a { color: #8a8a9a; text-decoration: none; }
   footer a:hover { color: #ff6b35; }
 
-  .output-ok { color: #22c55e; }
-  .output-err { color: #ef4444; }
+  .line-num { color: #3a3a5e; margin-right: 1em; user-select: none; }
 </style>
 </head>
 <body>
 
 <div class="container">
   <header>
-    <div class="logo">
-      <svg viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
-        <rect width="140" height="140" rx="24" fill="#0a0a14"/>
-        <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
-        <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
-        <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
-        <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
-        <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
-        <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
-        <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
-        <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
-        <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-      </svg>
-    </div>
-    <h1>yaml-validator</h1>
-    <p class="tagline">Validate YAML files for syntax, style, and schema correctness</p>
-    <div class="badges">
-      <a href="https://github.com/soumendrak/yaml-validator">GitHub</a>
-      <a href="https://github.com/soumendrak/yaml-validator/blob/main/LICENSE">MIT License</a>
-      <a href="https://python.org">Python 3.10+</a>
-      <a href="https://github.com/soumendrak/yaml-validator">PRs Welcome</a>
+    <svg width="36" height="36" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
+      <rect width="140" height="140" rx="24" fill="#0a0a14"/>
+      <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
+      <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
+      <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
+      <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
+      <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
+      <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
+      <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
+      <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
+      <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
+    <div>
+      <h1>YAML Validator</h1>
+      <div class="sub">Paste YAML to validate syntax, style, and structure</div>
     </div>
   </header>
 
-  <section>
-    <h2>Features</h2>
-    <div class="feature-grid">
-      <div class="feature-card">
-        <strong>Syntax Validation</strong>
-        <span>Catches malformed YAML with precise line &amp; column reporting</span>
-      </div>
-      <div class="feature-card">
-        <strong>Style Checks</strong>
-        <span>Trailing whitespace, tab indentation, line length, EOF newlines</span>
-      </div>
-      <div class="feature-card">
-        <strong>Schema Validation</strong>
-        <span>Validate structure against JSON Schema or YAML schema files</span>
-      </div>
-      <div class="feature-card">
-        <strong>CI Ready</strong>
-        <span>JSON output mode, reliable exit codes, quiet mode</span>
+  <div class="editor-row">
+    <div class="input-panel">
+      <textarea id="yamlInput" placeholder="Paste your YAML here...&#10;&#10;server:&#10;  host: localhost&#10;  port: 8080&#10;database:&#10;  url: postgres://db:5432/mydb" spellcheck="false"></textarea>
+      <div class="toolbar">
+        <button class="btn-validate" onclick="validate()">Validate</button>
+        <button class="btn-clear" onclick="clearAll()">Clear</button>
+        <button class="btn-example" onclick="loadExample('good')">Good YAML</button>
+        <button class="btn-example" onclick="loadExample('bad')">Bad YAML</button>
+        <span class="char-count" id="charCount">0 chars</span>
+        <span class="status-badge" id="statusBadge">Ready</span>
       </div>
     </div>
-  </section>
 
-  <section>
-    <h2>Quick Install</h2>
-    <div class="install-box">
-      pip install <code>git+https://github.com/soumendrak/yaml-validator.git</code>
+    <div class="output-panel">
+      <div id="output"></div>
     </div>
-    <p style="text-align:center; margin-top: 0.5rem;">or with <code>uvx</code> (no install):</p>
-    <div class="install-box" style="font-size: 0.85rem;">
-      uvx --from git+https://github.com/soumendrak/yaml-validator.git yaml-validator check file.yaml
-    </div>
-  </section>
+  </div>
 
-  <section>
-    <h2>Usage</h2>
-
-    <pre><code><span class="cmd">$</span> yaml-validator check config.yaml
-<span class="output-ok">✓ config.yaml</span>
-
-<span class="cmd">$</span> yaml-validator check bad.yaml
-<span class="output-err">[ERROR]</span> line 3:1: found character '\t' that cannot start any token
-
-<span class="output-err">✗ bad.yaml</span>
-   1 error(s)
-
-<span class="cmd">$</span> yaml-validator check data.yaml --schema schema.json --json
-{<span class="str">"valid"</span>: false, <span class="str">"errors"</span>: [...]}</code></pre>
-  </section>
-
-  <section>
-    <h2>Exit Codes</h2>
-    <pre><code><span class="output-ok"> 0</span>  All files pass validation
-<span class="output-err"> 1</span>  One or more files failed</code></pre>
-  </section>
+  <footer>
+    <p><a href="https://github.com/soumendrak/yaml-validator">soumendrak/yaml-validator</a> &middot; MIT License &middot; Validates entirely in your browser — no data leaves your machine</p>
+  </footer>
 </div>
 
-<footer>
-  <p><a href="https://github.com/soumendrak/yaml-validator">soumendrak/yaml-validator</a> &middot; MIT License</p>
-  <p>Built with ❤️ and zero unnecessary complexity</p>
-</footer>
+<script>
+'use strict';
 
+const input = document.getElementById('yamlInput');
+const output = document.getElementById('output');
+const badge = document.getElementById('statusBadge');
+const charCount = document.getElementById('charCount');
+
+input.addEventListener('input', () => {
+  charCount.textContent = `${input.value.length} chars`;
+});
+
+function clearAll() {
+  input.value = '';
+  output.innerHTML = '';
+  badge.textContent = 'Ready';
+  badge.className = 'status-badge';
+  charCount.textContent = '0 chars';
+}
+
+function escapeHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// innerHTML is safe here because ALL dynamic user content is passed through
+// escapeHtml() before insertion. Only hardcoded structural HTML (headings,
+// div wrappers, class names) is built with string literals.
+function lineNum(n) {
+  return `<span class="line-num">${n}</span>`;
+}
+
+function validate() {
+  const text = input.value;
+  output.innerHTML = '';
+
+  if (!text.trim()) {
+    output.innerHTML = '<span class="result-info">Nothing to validate — paste some YAML first.</span>';
+    badge.textContent = 'Ready';
+    badge.className = 'status-badge';
+    return;
+  }
+
+  const errors = [];
+  const warnings = [];
+  const lines = text.split('\n');
+
+  // ── Style checks ──
+  // Tab detection
+  lines.forEach((line, i) => {
+    if (line.startsWith('\t') && line.trim()) {
+      warnings.push({ msg: 'Tab used for indentation (YAML requires spaces)', line: i + 1, rule: 'no-tabs' });
+    }
+  });
+
+  // Trailing whitespace
+  lines.forEach((line, i) => {
+    if (line !== line.trimEnd() && line.trim()) {
+      warnings.push({ msg: 'Trailing whitespace', line: i + 1, rule: 'trailing-spaces' });
+    }
+  });
+
+  // Line length > 200
+  lines.forEach((line, i) => {
+    if (line.length > 200) {
+      warnings.push({ msg: `Line too long (${line.length} > 200 chars)`, line: i + 1, rule: 'line-length' });
+    }
+  });
+
+  // EOF newline
+  if (text.length > 0 && !text.endsWith('\n')) {
+    warnings.push({ msg: 'File does not end with a newline', line: lines.length, rule: 'end-of-file-newline' });
+  }
+
+  // ── Syntax validation ──
+  let parsed = null;
+  let multiDoc = false;
+
+  try {
+    // Try safeLoad first
+    parsed = jsyaml.load(text);
+  } catch (e1) {
+    // Try safeLoadAll for multi-doc
+    try {
+      parsed = jsyaml.loadAll(text);
+      multiDoc = true;
+    } catch (e2) {
+      // Report the first error (single-doc parse is usually more descriptive)
+      errors.push({ msg: e1.message, rule: 'yaml-syntax' });
+    }
+  }
+
+  // ── Build results ──
+  const hasErrors = errors.length > 0;
+  const hasWarnings = warnings.length > 0;
+
+  if (!hasErrors && parsed !== null) {
+    badge.textContent = 'Valid YAML ✓';
+    badge.className = 'status-badge ok';
+  } else if (hasErrors) {
+    badge.textContent = `${errors.length} error(s)`;
+    badge.className = 'status-badge err';
+  } else {
+    badge.textContent = 'Valid with warnings';
+    badge.className = 'status-badge ok';
+  }
+
+  // ── Render output ──
+  const parts = [];
+
+  if (errors.length > 0) {
+    parts.push(`<div class="result-heading">Syntax Errors</div>`);
+    errors.forEach(e => {
+      const loc = e.line ? ` line ${e.line}` : '';
+      parts.push(`<div class="result-err">✗ ${escapeHtml(e.msg)}</div>`);
+    });
+    parts.push('<div class="result-sep"></div>');
+  }
+
+  if (warnings.length > 0) {
+    parts.push(`<div class="result-heading">Warnings</div>`);
+    warnings.forEach(w => {
+      parts.push(`<div class="result-warn">⚠ line ${w.line}: ${escapeHtml(w.msg)}</div>`);
+    });
+    parts.push('<div class="result-sep"></div>');
+  }
+
+  if (!hasErrors) {
+    const docCount = multiDoc ? (Array.isArray(parsed) ? parsed.length : '?') : 1;
+    parts.push(`<div class="result-ok">✓ Valid YAML${docCount > 1 ? ` (${docCount} documents)` : ''}</div>`);
+
+    if (parsed !== null) {
+      try {
+        const pretty = JSON.stringify(parsed, null, 2);
+        parts.push(`
+          <details class="parsed-view">
+            <summary>Show parsed output</summary>
+            <pre>${escapeHtml(pretty)}</pre>
+          </details>
+        `);
+      } catch (_) {}
+    }
+  }
+
+  output.innerHTML = parts.join('\n');
+}
+
+function loadExample(type) {
+  if (type === 'good') {
+    input.value = `# Server configuration
+server:
+  host: localhost
+  port: 8080
+  ssl: true
+
+# Database connection
+database:
+  url: postgres://db:5432/mydb
+  pool_size: 10
+  timeout: 30
+
+# Feature flags
+features:
+  - name: logging
+    enabled: true
+  - name: metrics
+    enabled: false
+
+# Nested config
+cache:
+  redis:
+    host: redis.local
+    port: 6379
+    ttl: 3600
+`;
+  } else {
+    input.value = `# Bad YAML with issues
+server:
+  host: localhost
+	port: 8080  # ← this line starts with a tab
+  ssl: true   
+
+database:
+  url: postgres://db:5432/mydb
+  pool_size: 10
+    timeout: 30  # ← bad indentation
+
+features:
+  - name: logging
+  enabled: true  # ← inconsistent indent
+
+broken:
+  - unclosed block
+  - another
+`;
+  }
+  charCount.textContent = `${input.value.length} chars`;
+  validate();
+}
+
+// Auto-validate on Command/Ctrl + Enter
+input.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    e.preventDefault();
+    validate();
+  }
+});
+
+// Initial silent state
+charCount.textContent = '0 chars';
+</script>
 </body>
 </html>
