@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>yaml-validator — Validate YAML files</title>
+<meta name="description" content="Validate YAML files for syntax, style, and schema correctness. Python CLI tool with JSON Schema support.">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0a0a14;
+    color: #f0ece4;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
+    line-height: 1.6;
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+  }
+
+  .container {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+    flex: 1;
+  }
+
+  header {
+    text-align: center;
+    padding: 3rem 0 2rem;
+  }
+
+  .logo {
+    margin-bottom: 1.5rem;
+  }
+  .logo svg {
+    width: 120px;
+    height: 120px;
+  }
+
+  h1 {
+    font-size: 2.5rem;
+    font-weight: 700;
+    color: #ff6b35;
+    letter-spacing: -0.02em;
+  }
+  .tagline {
+    font-size: 1.1rem;
+    color: #8a8a9a;
+    margin-top: 0.5rem;
+  }
+
+  .badges {
+    display: flex;
+    gap: 0.5rem;
+    justify-content: center;
+    flex-wrap: wrap;
+    margin-top: 1rem;
+  }
+  .badges a {
+    display: inline-block;
+    padding: 0.25rem 0.75rem;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    text-decoration: none;
+    color: #fff;
+    background: #1a1a2e;
+    border: 1px solid #2a2a3e;
+    transition: border-color 0.2s;
+  }
+  .badges a:hover { border-color: #ff6b35; }
+
+  section {
+    margin: 2.5rem 0;
+  }
+
+  h2 {
+    font-size: 1.3rem;
+    font-weight: 600;
+    color: #ff6b35;
+    margin-bottom: 1rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid #1a1a2e;
+  }
+
+  p { color: #c0c0d0; margin-bottom: 1rem; }
+
+  .feature-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  @media (max-width: 500px) { .feature-grid { grid-template-columns: 1fr; } }
+  .feature-card {
+    background: #1a1a2e;
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    border: 1px solid #2a2a3e;
+  }
+  .feature-card strong { color: #f0ece4; display: block; margin-bottom: 0.2rem; }
+  .feature-card span { color: #8a8a9a; font-size: 0.85rem; }
+
+  pre {
+    background: #111122;
+    border-radius: 8px;
+    padding: 1rem;
+    overflow-x: auto;
+    border: 1px solid #2a2a3e;
+    margin-bottom: 1rem;
+    font-size: 0.85rem;
+  }
+  code {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+    color: #ff6b35;
+  }
+  pre code { color: #c0c0d0; }
+  .cmd { color: #22c55e; }
+  .str { color: #e2b96f; }
+  .cmt { color: #5a5a7e; }
+
+  .install-box {
+    background: #1a1a2e;
+    border-radius: 8px;
+    padding: 1rem;
+    border: 1px solid #2a2a3e;
+    text-align: center;
+    font-size: 1rem;
+  }
+  .install-box code {
+    color: #ff6b35;
+    background: #0a0a14;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+  }
+
+  footer {
+    text-align: center;
+    padding: 2rem;
+    color: #5a5a7e;
+    font-size: 0.8rem;
+  }
+  footer a { color: #8a8a9a; text-decoration: none; }
+  footer a:hover { color: #ff6b35; }
+
+  .output-ok { color: #22c55e; }
+  .output-err { color: #ef4444; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <header>
+    <div class="logo">
+      <svg viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
+        <rect width="140" height="140" rx="24" fill="#0a0a14"/>
+        <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
+        <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
+        <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
+        <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
+        <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
+        <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
+        <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
+        <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
+        <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>yaml-validator</h1>
+    <p class="tagline">Validate YAML files for syntax, style, and schema correctness</p>
+    <div class="badges">
+      <a href="https://github.com/soumendrak/yaml-validator">GitHub</a>
+      <a href="https://github.com/soumendrak/yaml-validator/blob/main/LICENSE">MIT License</a>
+      <a href="https://python.org">Python 3.10+</a>
+      <a href="https://github.com/soumendrak/yaml-validator">PRs Welcome</a>
+    </div>
+  </header>
+
+  <section>
+    <h2>Features</h2>
+    <div class="feature-grid">
+      <div class="feature-card">
+        <strong>Syntax Validation</strong>
+        <span>Catches malformed YAML with precise line &amp; column reporting</span>
+      </div>
+      <div class="feature-card">
+        <strong>Style Checks</strong>
+        <span>Trailing whitespace, tab indentation, line length, EOF newlines</span>
+      </div>
+      <div class="feature-card">
+        <strong>Schema Validation</strong>
+        <span>Validate structure against JSON Schema or YAML schema files</span>
+      </div>
+      <div class="feature-card">
+        <strong>CI Ready</strong>
+        <span>JSON output mode, reliable exit codes, quiet mode</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Quick Install</h2>
+    <div class="install-box">
+      pip install <code>git+https://github.com/soumendrak/yaml-validator.git</code>
+    </div>
+    <p style="text-align:center; margin-top: 0.5rem;">or with <code>uvx</code> (no install):</p>
+    <div class="install-box" style="font-size: 0.85rem;">
+      uvx --from git+https://github.com/soumendrak/yaml-validator.git yaml-validator check file.yaml
+    </div>
+  </section>
+
+  <section>
+    <h2>Usage</h2>
+
+    <pre><code><span class="cmd">$</span> yaml-validator check config.yaml
+<span class="output-ok">✓ config.yaml</span>
+
+<span class="cmd">$</span> yaml-validator check bad.yaml
+<span class="output-err">[ERROR]</span> line 3:1: found character '\t' that cannot start any token
+
+<span class="output-err">✗ bad.yaml</span>
+   1 error(s)
+
+<span class="cmd">$</span> yaml-validator check data.yaml --schema schema.json --json
+{<span class="str">"valid"</span>: false, <span class="str">"errors"</span>: [...]}</code></pre>
+  </section>
+
+  <section>
+    <h2>Exit Codes</h2>
+    <pre><code><span class="output-ok"> 0</span>  All files pass validation
+<span class="output-err"> 1</span>  One or more files failed</code></pre>
+  </section>
+</div>
+
+<footer>
+  <p><a href="https://github.com/soumendrak/yaml-validator">soumendrak/yaml-validator</a> &middot; MIT License</p>
+  <p>Built with ❤️ and zero unnecessary complexity</p>
+</footer>
+
+</body>
+</html>
