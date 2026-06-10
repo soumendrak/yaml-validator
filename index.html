@@ -67,14 +67,6 @@
   }
   .btn-validate:hover { background: #ff8555; }
 
-  .btn-fix {
-    background: #1a4a2e;
-    color: #22c55e;
-    border: 1px solid #22c55e;
-  }
-  .btn-fix:hover { background: #1a5a3e; }
-  .btn-fix:disabled { opacity: 0.35; cursor: not-allowed; }
-
   .btn-ghost {
     background: transparent;
     color: #5a5a7e;
@@ -285,7 +277,6 @@
   <div class="toolbar">
     <button class="btn-ghost" onclick="loadExample('good')">Good YAML</button>
     <button class="btn-ghost" onclick="loadExample('bad')">Bad YAML</button>
-    <button class="btn-fix" id="btnFix" onclick="autoFix()" disabled>Auto-correct</button>
     <button class="btn-validate" onclick="validate()">Validate</button>
     <span class="badge" id="statusBadge">Ready</span>
   </div>
@@ -324,8 +315,7 @@ const input    = document.getElementById('yamlInput');
 const output   = document.getElementById('output');
 const badge    = document.getElementById('statusBadge');
 const lineNums = document.getElementById('lineNumbers');
-const btnFix   = document.getElementById('btnFix');
-const charC    = document.getElementById('charCount');
+const charC  = document.getElementById('charCount');
 
 // ── Line numbers ──
 let errLines = new Set();
@@ -349,7 +339,6 @@ input.addEventListener('scroll', () => {
 // Update lines on any change
 input.addEventListener('input', () => {
   renderLineNumbers();
-  btnFix.disabled = false;
   // Auto-validate with debounce
   clearTimeout(input._debounce);
   input._debounce = setTimeout(validate, 400);
@@ -427,7 +416,6 @@ function validate() {
   } else if (hasE) {
     badge.textContent = `${errors.length} error(s)`;
     badge.className = 'badge err';
-    btnFix.disabled = false;
   } else {
     badge.textContent = 'Valid with warnings';
     badge.className = 'badge warn';
@@ -475,60 +463,6 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
-}
-
-// ── Auto-correct ──
-function autoFix() {
-  const text = input.value;
-  if (!text.trim()) return;
-
-  let fixed = false;
-
-  // 1. Replace ALL tabs with 2 spaces (tabs are invalid in YAML everywhere)
-  let result = text.replace(/\t/g, '  ');
-  if (result !== text) fixed = true;
-
-  // 2. Strip accidental leading single-space (common copy-paste typo).
-  //    Valid YAML never uses exactly 1 space for indentation.
-  const lines = result.split('\n');
-  const fixedLines = lines.map((line) => {
-    if (line.length > 0 && line[0] === ' ' && line[1] !== ' ' && line.trim()) {
-      fixed = true;
-      return line.slice(1);
-    }
-    return line;
-  });
-  result = fixedLines.join('\n');
-
-  // 3. Trim trailing whitespace per line
-  const trimmedLines = result.split('\n').map((line) => {
-    const trimmed = line.trimEnd();
-    if (trimmed !== line && line.trim()) {
-      fixed = true;
-      return trimmed;
-    }
-    return line;
-  });
-  result = trimmedLines.join('\n');
-
-  // 4. Add trailing newline if missing
-  if (result.length > 0 && !result.endsWith('\n')) {
-    result += '\n';
-    fixed = true;
-  }
-
-  if (fixed) {
-    input.value = result;
-    btnFix.disabled = true;
-    renderLineNumbers();
-    validate();
-  } else {
-    btnFix.disabled = true;
-    const old = badge.textContent;
-    badge.textContent = 'Nothing to fix';
-    badge.className = 'badge';
-    setTimeout(() => { badge.textContent = old; }, 1500);
-  }
 }
 
 // ── Examples ──
@@ -581,7 +515,6 @@ broken:
   - another
 `;
   }
-  btnFix.disabled = false;
   renderLineNumbers();
   validate();
 }
