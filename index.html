@@ -8,90 +8,58 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/js-yaml/4.1.0/js-yaml.min.js" integrity="sha384-+pxiN6T7yvpryuJmE1gM9PX7yQit15auDb+ZwwvJOd/4be2Cie5/IuVXgQb/S9du" crossorigin="anonymous"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; overflow: hidden; }
   body {
     background: #0a0a14;
     color: #f0ece4;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', sans-serif;
-    line-height: 1.6;
-    min-height: 100vh;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
   }
 
-  .container {
-    max-width: 960px;
-    margin: 0 auto;
-    padding: 1.5rem;
-  }
-
+  /* ── Header ── */
   header {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-    padding-bottom: 1rem;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    background: #0f0f1e;
     border-bottom: 1px solid #1a1a2e;
+    flex-shrink: 0;
   }
-  header svg { flex-shrink: 0; }
+  header svg { flex-shrink: 0; display: block; }
   header h1 {
-    font-size: 1.4rem;
+    font-size: 1rem;
     font-weight: 600;
     color: #ff6b35;
+    white-space: nowrap;
   }
   header .sub {
-    font-size: 0.85rem;
-    color: #8a8a9a;
+    font-size: 0.75rem;
+    color: #5a5a7e;
+    white-space: nowrap;
   }
-
-  .editor-row {
-    display: flex;
-    gap: 1rem;
-    align-items: flex-start;
-  }
-  @media (max-width: 700px) {
-    .editor-row { flex-direction: column; }
-  }
-
-  .input-panel {
-    flex: 1;
-    min-width: 0;
-  }
-
-  textarea {
-    width: 100%;
-    height: 400px;
-    background: #111122;
-    color: #f0ece4;
-    border: 1px solid #2a2a3e;
-    border-radius: 8px;
-    padding: 1rem;
-    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
-    font-size: 0.85rem;
-    line-height: 1.5;
-    resize: vertical;
-    outline: none;
-    transition: border-color 0.2s;
-    tab-size: 2;
-  }
-  textarea:focus { border-color: #ff6b35; }
-  textarea::placeholder { color: #5a5a7e; }
+  .header-spacer { flex: 1; }
 
   .toolbar {
     display: flex;
-    gap: 0.5rem;
-    margin-top: 0.75rem;
-    flex-wrap: wrap;
+    gap: 0.35rem;
     align-items: center;
+    flex-shrink: 0;
   }
 
   button {
-    padding: 0.5rem 1.25rem;
+    padding: 0.35rem 0.85rem;
     border: none;
-    border-radius: 6px;
-    font-size: 0.85rem;
+    border-radius: 5px;
+    font-size: 0.78rem;
     font-weight: 500;
     cursor: pointer;
-    transition: background 0.2s, opacity 0.2s;
+    transition: background 0.15s, opacity 0.15s;
+    white-space: nowrap;
   }
-  button:active { transform: scale(0.97); }
+  button:active { transform: scale(0.96); }
 
   .btn-validate {
     background: #ff6b35;
@@ -99,284 +67,398 @@
   }
   .btn-validate:hover { background: #ff8555; }
 
-  .btn-clear {
-    background: #1a1a2e;
-    color: #8a8a9a;
+  .btn-fix {
+    background: #1a4a2e;
+    color: #22c55e;
+    border: 1px solid #22c55e;
+  }
+  .btn-fix:hover { background: #1a5a3e; }
+  .btn-fix:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  .btn-ghost {
+    background: transparent;
+    color: #5a5a7e;
     border: 1px solid #2a2a3e;
   }
-  .btn-clear:hover { color: #f0ece4; border-color: #5a5a7e; }
+  .btn-ghost:hover { color: #f0ece4; border-color: #5a5a7e; }
 
-  .btn-example {
-    background: transparent;
-    color: #8a8a9a;
-    border: 1px dashed #2a2a3e;
-    font-size: 0.8rem;
-  }
-  .btn-example:hover { color: #ff6b35; border-color: #ff6b35; }
-
-  .status-badge {
-    margin-left: auto;
-    font-size: 0.8rem;
-    padding: 0.25rem 0.75rem;
-    border-radius: 4px;
+  .badge {
+    font-size: 0.72rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 3px;
     background: #1a1a2e;
     color: #5a5a7e;
+    white-space: nowrap;
   }
-  .status-badge.ok { background: #0a2a1a; color: #22c55e; border: 1px solid #22c55e; }
-  .status-badge.err { background: #2a0a0a; color: #ef4444; border: 1px solid #ef4444; }
+  .badge.ok { background: #0a2a1a; color: #22c55e; border: 1px solid #22c55e; }
+  .badge.err { background: #2a0a0a; color: #ef4444; border: 1px solid #ef4444; }
+  .badge.warn { background: #2a2a0a; color: #e2b96f; border: 1px solid #e2b96f; }
 
+  .char-count {
+    font-size: 0.72rem;
+    color: #3a3a5e;
+    white-space: nowrap;
+  }
+
+  /* ── Main editor area ── */
+  .editor-area {
+    flex: 1;
+    display: flex;
+    gap: 1px;
+    background: #1a1a2e;
+    min-height: 0;  /* flex override */
+  }
+
+  /* ── Input panel (left) ── */
+  .input-panel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: #0a0a14;
+  }
+  .input-panel .panel-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.75rem;
+    background: #0f0f1e;
+    border-bottom: 1px solid #1a1a2e;
+    font-size: 0.72rem;
+    color: #5a5a7e;
+    flex-shrink: 0;
+  }
+  .input-panel .panel-header .label { font-weight: 600; color: #8a8a9a; }
+
+  .editor-wrap {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    position: relative;
+  }
+
+  .line-numbers {
+    padding: 0.75rem 0 0.75rem 0.75rem;
+    text-align: right;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    color: #2a2a4e;
+    user-select: none;
+    overflow: hidden;
+    min-width: 3em;
+    background: #0a0a14;
+    border-right: 1px solid #1a1a2e;
+    white-space: pre;
+  }
+  .line-numbers .hl { color: #ff6b35; }
+
+  #yamlInput {
+    flex: 1;
+    background: transparent;
+    color: #f0ece4;
+    border: none;
+    outline: none;
+    padding: 0.75rem 0.75rem 0.75rem 0.5rem;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.78rem;
+    line-height: 1.5;
+    resize: none;
+    tab-size: 2;
+    white-space: pre;
+    overflow-wrap: normal;
+    overflow-x: auto;
+  }
+  #yamlInput::placeholder { color: #2a2a4e; }
+
+  /* ── Output panel (right) ── */
   .output-panel {
     flex: 1;
+    display: flex;
+    flex-direction: column;
     min-width: 0;
+    background: #0a0a14;
   }
+  .output-panel .panel-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.35rem 0.75rem;
+    background: #0f0f1e;
+    border-bottom: 1px solid #1a1a2e;
+    font-size: 0.72rem;
+    color: #5a5a7e;
+    flex-shrink: 0;
+  }
+  .output-panel .panel-header .label { font-weight: 600; color: #8a8a9a; }
 
   #output {
-    background: #111122;
-    border: 1px solid #2a2a3e;
-    border-radius: 8px;
-    min-height: 400px;
-    max-height: 500px;
-    overflow-y: auto;
-    padding: 1rem;
-    font-family: 'JetBrains Mono', 'Fira Code', monospace;
-    font-size: 0.8rem;
+    flex: 1;
+    padding: 0.75rem;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    font-size: 0.78rem;
     line-height: 1.6;
     white-space: pre-wrap;
     word-break: break-word;
+    overflow-y: auto;
+    min-height: 0;
   }
   #output:empty::before {
-    content: 'Results will appear here after validation';
-    color: #5a5a7e;
+    content: 'Results appear here after validation';
+    color: #2a2a4e;
     font-style: italic;
   }
 
-  .result-ok { color: #22c55e; font-weight: 600; }
-  .result-err { color: #ef4444; }
-  .result-warn { color: #e2b96f; }
-  .result-info { color: #8a8a9a; }
-  .result-line { color: #5a5a7e; }
-  .result-sep { border-top: 1px solid #2a2a3e; margin: 0.5rem 0; padding-top: 0.5rem; }
-  .result-heading { color: #ff6b35; font-weight: 600; margin-bottom: 0.25rem; }
+  /* ── Result styles ── */
+  .r-ok { color: #22c55e; font-weight: 600; }
+  .r-err { color: #ef4444; display: flex; align-items: baseline; gap: 0.5em; }
+  .r-warn { color: #e2b96f; display: flex; align-items: baseline; gap: 0.5em; }
+  .r-info { color: #5a5a7e; }
+  .r-sep { border-top: 1px solid #1a1a2e; margin: 0.4em 0; padding-top: 0.4em; }
+  .r-heading { color: #ff6b35; font-weight: 600; margin-bottom: 0.3em; font-size: 0.8rem; }
+  .r-line { color: #3a3a5e; font-size: 0.7rem; margin-left: 1.5em; }
+  .r-icon { flex-shrink: 0; }
+
+  .parsed-toggle {
+    background: none;
+    border: none;
+    color: #5a5a7e;
+    font-size: 0.75rem;
+    cursor: pointer;
+    padding: 0.25rem 0;
+    font-family: inherit;
+  }
+  .parsed-toggle:hover { color: #ff6b35; }
   .parsed-view {
     background: #0a0a14;
     border: 1px solid #1a1a2e;
-    border-radius: 6px;
-    padding: 0.75rem;
-    margin-top: 0.5rem;
-    max-height: 300px;
+    border-radius: 4px;
+    padding: 0.5rem;
+    margin-top: 0.3rem;
+    max-height: 200px;
     overflow: auto;
-    font-size: 0.78rem;
+    font-size: 0.72rem;
+    display: none;
   }
-  .parsed-view summary {
-    cursor: pointer;
-    color: #8a8a9a;
-    font-size: 0.8rem;
-    user-select: none;
-  }
-  .parsed-view summary:hover { color: #ff6b35; }
+  .parsed-view.open { display: block; }
 
-  .char-count {
-    color: #5a5a7e;
-    font-size: 0.75rem;
+  /* ── Resize handle ── */
+  .resize-handle {
+    width: 4px;
+    background: #1a1a2e;
+    cursor: col-resize;
+    flex-shrink: 0;
+    transition: background 0.15s;
   }
+  .resize-handle:hover, .resize-handle.active { background: #ff6b35; }
 
-  footer {
-    text-align: center;
-    padding: 2rem 1rem 1rem;
-    color: #5a5a7e;
-    font-size: 0.75rem;
+  /* ── Error line highlight ── */
+  .err-line { background: #2a0a0a; }
+
+  @media (max-width: 600px) {
+    .editor-area { flex-direction: column; }
+    .resize-handle { display: none; }
+    header h1 { font-size: 0.9rem; }
+    header .sub { display: none; }
+    .char-count { display: none; }
   }
-  footer a { color: #8a8a9a; text-decoration: none; }
-  footer a:hover { color: #ff6b35; }
-
-  .line-num { color: #3a3a5e; margin-right: 1em; user-select: none; }
 </style>
 </head>
 <body>
 
-<div class="container">
-  <header>
-    <svg width="36" height="36" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
-      <rect width="140" height="140" rx="24" fill="#0a0a14"/>
-      <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
-      <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
-      <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
-      <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
-      <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
-      <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
-      <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
-      <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
-      <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
-    </svg>
-    <div>
-      <h1>YAML Validator</h1>
-      <div class="sub">Paste YAML to validate syntax, style, and structure</div>
-    </div>
-  </header>
+<header>
+  <svg width="24" height="24" viewBox="0 0 140 140" xmlns="http://www.w3.org/2000/svg">
+    <rect width="140" height="140" rx="24" fill="#0a0a14"/>
+    <rect x="28" y="24" width="84" height="92" rx="6" fill="#1a1a2e" stroke="#ff6b35" stroke-width="2"/>
+    <rect x="40" y="40" width="60" height="4" rx="2" fill="#ff6b35" opacity="0.9"/>
+    <rect x="40" y="52" width="44" height="4" rx="2" fill="#5a5a7e"/>
+    <rect x="52" y="64" width="36" height="4" rx="2" fill="#ff6b35" opacity="0.8"/>
+    <rect x="52" y="76" width="20" height="4" rx="2" fill="#5a5a7e"/>
+    <rect x="52" y="88" width="36" height="4" rx="2" fill="#5a5a7e"/>
+    <rect x="40" y="100" width="28" height="4" rx="2" fill="#5a5a7e"/>
+    <circle cx="98" cy="100" r="18" fill="#22c55e" opacity="0.95"/>
+    <path d="M91 100l5 5 10-10" fill="none" stroke="#0a0a14" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+  <h1>YAML Validator</h1>
+  <span class="sub">Paste YAML to validate</span>
+  <div class="header-spacer"></div>
+  <div class="toolbar">
+    <button class="btn-ghost" onclick="loadExample('good')">Good YAML</button>
+    <button class="btn-ghost" onclick="loadExample('bad')">Bad YAML</button>
+    <button class="btn-fix" id="btnFix" onclick="autoFix()" disabled>Auto-correct</button>
+    <button class="btn-validate" onclick="validate()">Validate</button>
+    <span class="badge" id="statusBadge">Ready</span>
+  </div>
+</header>
 
-  <div class="editor-row">
-    <div class="input-panel">
-      <textarea id="yamlInput" placeholder="Paste your YAML here...&#10;&#10;server:&#10;  host: localhost&#10;  port: 8080&#10;database:&#10;  url: postgres://db:5432/mydb" spellcheck="false"></textarea>
-      <div class="toolbar">
-        <button class="btn-validate" onclick="validate()">Validate</button>
-        <button class="btn-clear" onclick="clearAll()">Clear</button>
-        <button class="btn-example" onclick="loadExample('good')">Good YAML</button>
-        <button class="btn-example" onclick="loadExample('bad')">Bad YAML</button>
-        <span class="char-count" id="charCount">0 chars</span>
-        <span class="status-badge" id="statusBadge">Ready</span>
-      </div>
+<div class="editor-area">
+  <!-- Left: Input -->
+  <div class="input-panel">
+    <div class="panel-header">
+      <span class="label">YAML Input</span>
+      <span class="char-count" id="charCount">0 lines</span>
     </div>
-
-    <div class="output-panel">
-      <div id="output"></div>
+    <div class="editor-wrap" id="editorWrap">
+      <div class="line-numbers" id="lineNumbers" aria-hidden="true">1</div>
+      <textarea id="yamlInput" placeholder="# Paste your YAML here...&#10;server:&#10;  host: localhost&#10;  port: 8080" spellcheck="false"></textarea>
     </div>
   </div>
 
-  <footer>
-    <p><a href="https://github.com/soumendrak/yaml-validator">soumendrak/yaml-validator</a> &middot; MIT License &middot; Validates entirely in your browser — no data leaves your machine</p>
-  </footer>
+  <!-- Resize handle -->
+  <div class="resize-handle" id="resizeHandle"></div>
+
+  <!-- Right: Output -->
+  <div class="output-panel">
+    <div class="panel-header">
+      <span class="label">Results</span>
+    </div>
+    <div id="output"></div>
+  </div>
 </div>
 
 <script>
 'use strict';
 
-const input = document.getElementById('yamlInput');
-const output = document.getElementById('output');
-const badge = document.getElementById('statusBadge');
-const charCount = document.getElementById('charCount');
+// ── Refs ──
+const input    = document.getElementById('yamlInput');
+const output   = document.getElementById('output');
+const badge    = document.getElementById('statusBadge');
+const lineNums = document.getElementById('lineNumbers');
+const btnFix   = document.getElementById('btnFix');
+const charC    = document.getElementById('charCount');
 
-input.addEventListener('input', () => {
-  charCount.textContent = `${input.value.length} chars`;
+// ── Line numbers ──
+let errLines = new Set();
+
+function renderLineNumbers() {
+  const lines = input.value.split('\n');
+  const count = lines.length;
+  const frag = [];
+  for (let i = 1; i <= count; i++) {
+    frag.push(errLines.has(i) ? `<span class="hl">${i}</span>` : i);
+  }
+  lineNums.innerHTML = frag.join('\n');
+  charC.textContent = `${count} lines`;
+}
+
+// Sync scroll: textarea ↔ line numbers
+input.addEventListener('scroll', () => {
+  lineNums.scrollTop = input.scrollTop;
 });
 
-function clearAll() {
-  input.value = '';
-  output.innerHTML = '';
-  badge.textContent = 'Ready';
-  badge.className = 'status-badge';
-  charCount.textContent = '0 chars';
-}
+// Update lines on any change
+input.addEventListener('input', () => {
+  renderLineNumbers();
+  btnFix.disabled = false;
+  // Auto-validate with debounce
+  clearTimeout(input._debounce);
+  input._debounce = setTimeout(validate, 400);
+});
 
-function escapeHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
+// Keyboard shortcut: Cmd/Ctrl+Enter
+input.addEventListener('keydown', (e) => {
+  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+    e.preventDefault();
+    validate();
+  }
+});
 
-// innerHTML is safe here because ALL dynamic user content is passed through
-// escapeHtml() before insertion. Only hardcoded structural HTML (headings,
-// div wrappers, class names) is built with string literals.
-function lineNum(n) {
-  return `<span class="line-num">${n}</span>`;
-}
-
+// ── Validate ──
 function validate() {
   const text = input.value;
+  errLines = new Set();
   output.innerHTML = '';
 
   if (!text.trim()) {
-    output.innerHTML = '<span class="result-info">Nothing to validate — paste some YAML first.</span>';
     badge.textContent = 'Ready';
-    badge.className = 'status-badge';
+    badge.className = 'badge';
+    renderLineNumbers();
     return;
   }
 
-  const errors = [];
+  const errors   = [];
   const warnings = [];
-  const lines = text.split('\n');
+  const lines    = text.split('\n');
 
-  // ── Style checks ──
-  // Tab detection
+  // ── Style lint ──
   lines.forEach((line, i) => {
-    if (line.startsWith('\t') && line.trim()) {
-      warnings.push({ msg: 'Tab used for indentation (YAML requires spaces)', line: i + 1, rule: 'no-tabs' });
-    }
+    if (line.startsWith('\t') && line.trim())
+      warnings.push({ msg: 'Tab used for indentation (use spaces)', line: i + 1, rule: 'no-tabs' });
   });
-
-  // Trailing whitespace
   lines.forEach((line, i) => {
-    if (line !== line.trimEnd() && line.trim()) {
+    if (line !== line.trimEnd() && line.trim())
       warnings.push({ msg: 'Trailing whitespace', line: i + 1, rule: 'trailing-spaces' });
-    }
   });
-
-  // Line length > 200
   lines.forEach((line, i) => {
-    if (line.length > 200) {
-      warnings.push({ msg: `Line too long (${line.length} > 200 chars)`, line: i + 1, rule: 'line-length' });
-    }
+    if (line.length > 200)
+      warnings.push({ msg: `Line too long (${line.length} > 200)`, line: i + 1, rule: 'line-length' });
   });
+  if (text.length > 0 && !text.endsWith('\n'))
+    warnings.push({ msg: 'No trailing newline', line: lines.length, rule: 'end-of-file-newline' });
 
-  // EOF newline
-  if (text.length > 0 && !text.endsWith('\n')) {
-    warnings.push({ msg: 'File does not end with a newline', line: lines.length, rule: 'end-of-file-newline' });
-  }
-
-  // ── Syntax validation ──
+  // ── Syntax check ──
   let parsed = null;
   let multiDoc = false;
-
   try {
-    // Try safeLoad first
     parsed = jsyaml.load(text);
   } catch (e1) {
-    // Try safeLoadAll for multi-doc
     try {
       parsed = jsyaml.loadAll(text);
       multiDoc = true;
     } catch (e2) {
-      // Report the first error (single-doc parse is usually more descriptive)
       errors.push({ msg: e1.message, rule: 'yaml-syntax' });
+      // Extract line number from js-yaml error
+      const lm = e1.message.match(/\bline\s+(\d+)/i);
+      if (lm) errLines.add(parseInt(lm[1], 10));
     }
   }
 
-  // ── Build results ──
-  const hasErrors = errors.length > 0;
-  const hasWarnings = warnings.length > 0;
+  // ── Render ──
+  const hasE = errors.length > 0;
+  const hasW = warnings.length > 0;
 
-  if (!hasErrors && parsed !== null) {
-    badge.textContent = 'Valid YAML ✓';
-    badge.className = 'status-badge ok';
-  } else if (hasErrors) {
+  if (!hasE && parsed !== null) {
+    badge.textContent = 'Valid ✓';
+    badge.className = 'badge ok';
+  } else if (hasE) {
     badge.textContent = `${errors.length} error(s)`;
-    badge.className = 'status-badge err';
+    badge.className = 'badge err';
+    btnFix.disabled = false;
   } else {
     badge.textContent = 'Valid with warnings';
-    badge.className = 'status-badge ok';
+    badge.className = 'badge warn';
   }
 
-  // ── Render output ──
+  renderLineNumbers();
+
   const parts = [];
 
-  if (errors.length > 0) {
-    parts.push(`<div class="result-heading">Syntax Errors</div>`);
+  if (hasE) {
+    parts.push(`<div class="r-heading">✗ Syntax Errors</div>`);
     errors.forEach(e => {
-      const loc = e.line ? ` line ${e.line}` : '';
-      parts.push(`<div class="result-err">✗ ${escapeHtml(e.msg)}</div>`);
+      parts.push(`<div class="r-err"><span class="r-icon">✗</span> ${esc(e.msg)}</div>`);
     });
-    parts.push('<div class="result-sep"></div>');
+    parts.push(`<div class="r-sep"></div>`);
   }
 
-  if (warnings.length > 0) {
-    parts.push(`<div class="result-heading">Warnings</div>`);
+  if (hasW) {
+    parts.push(`<div class="r-heading">⚠ Warnings</div>`);
     warnings.forEach(w => {
-      parts.push(`<div class="result-warn">⚠ line ${w.line}: ${escapeHtml(w.msg)}</div>`);
+      parts.push(`<div class="r-warn"><span class="r-icon">⚠</span> line ${w.line}: ${esc(w.msg)}</div>`);
     });
-    parts.push('<div class="result-sep"></div>');
+    parts.push(`<div class="r-sep"></div>`);
   }
 
-  if (!hasErrors) {
-    const docCount = multiDoc ? (Array.isArray(parsed) ? parsed.length : '?') : 1;
-    parts.push(`<div class="result-ok">✓ Valid YAML${docCount > 1 ? ` (${docCount} documents)` : ''}</div>`);
+  if (!hasE) {
+    const docC = multiDoc ? (Array.isArray(parsed) ? parsed.length : '?') : 1;
+    parts.push(`<div class="r-ok">✓ Valid YAML${docC > 1 ? ` (${docC} documents)` : ''}</div>`);
 
     if (parsed !== null) {
       try {
         const pretty = JSON.stringify(parsed, null, 2);
         parts.push(`
-          <details class="parsed-view">
-            <summary>Show parsed output</summary>
-            <pre>${escapeHtml(pretty)}</pre>
-          </details>
+          <button class="parsed-toggle" onclick="this.nextElementSibling.classList.toggle('open'); this.textContent = this.nextElementSibling.classList.contains('open') ? '▾ Hide parsed' : '▸ Show parsed'">▸ Show parsed</button>
+          <div class="parsed-view">${esc(pretty)}</div>
         `);
       } catch (_) {}
     }
@@ -385,6 +467,67 @@ function validate() {
   output.innerHTML = parts.join('\n');
 }
 
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ── Auto-correct ──
+function autoFix() {
+  const text = input.value;
+  if (!text.trim()) return;
+
+  let lines = text.split('\n');
+  let fixed = false;
+
+  // 1. Tabs → 2 spaces
+  const newLines = lines.map((line, i) => {
+    if (line.startsWith('\t') && line.trim()) {
+      fixed = true;
+      // Count leading tabs
+      const lead = line.match(/^\t+/);
+      const count = lead ? lead[0].length : 0;
+      return '  '.repeat(count) + line.slice(count);
+    }
+    return line;
+  });
+  lines = newLines;
+
+  // 2. Trim trailing whitespace
+  lines = lines.map((line, i) => {
+    const trimmed = line.trimEnd();
+    if (trimmed !== line && line.trim()) {
+      fixed = true;
+      return trimmed;
+    }
+    return line;
+  });
+
+  let result = lines.join('\n');
+
+  // 3. Add trailing newline if missing
+  if (result.length > 0 && !result.endsWith('\n')) {
+    result += '\n';
+    fixed = true;
+  }
+
+  if (fixed) {
+    input.value = result;
+    btnFix.disabled = true;
+    renderLineNumbers();
+    validate();
+  } else {
+    btnFix.disabled = true;
+    // Flash a message
+    const old = badge.textContent;
+    badge.textContent = 'Nothing to fix';
+    badge.className = 'badge';
+    setTimeout(() => { badge.textContent = old; }, 1500);
+  }
+}
+
+// ── Examples ──
 function loadExample(type) {
   if (type === 'good') {
     input.value = `# Server configuration
@@ -434,20 +577,42 @@ broken:
   - another
 `;
   }
-  charCount.textContent = `${input.value.length} chars`;
+  btnFix.disabled = false;
+  renderLineNumbers();
   validate();
 }
 
-// Auto-validate on Command/Ctrl + Enter
-input.addEventListener('keydown', (e) => {
-  if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-    e.preventDefault();
-    validate();
-  }
-});
+// ── Resize handle ──
+(function() {
+  const handle = document.getElementById('resizeHandle');
+  const wrap = document.querySelector('.editor-area');
+  let active = false;
 
-// Initial silent state
-charCount.textContent = '0 chars';
+  handle.addEventListener('mousedown', (e) => {
+    active = true;
+    handle.classList.add('active');
+    e.preventDefault();
+  });
+
+  document.addEventListener('mousemove', (e) => {
+    if (!active) return;
+    const rect = wrap.getBoundingClientRect();
+    const pct = ((e.clientX - rect.left) / rect.width) * 100;
+    if (pct < 20 || pct > 80) return;
+    document.querySelector('.input-panel').style.flex = `${pct} 1 0`;
+    document.querySelector('.output-panel').style.flex = `${100 - pct} 1 0`;
+  });
+
+  document.addEventListener('mouseup', () => {
+    if (active) {
+      active = false;
+      handle.classList.remove('active');
+    }
+  });
+})();
+
+// ── Init ──
+renderLineNumbers();
 </script>
 </body>
 </html>
