@@ -146,3 +146,48 @@ def test_fix_json_reports_fixes(tmp_path):
     assert payload["fixed"] == {"trailing-spaces": 1, "end-of-file-newline": 1}
     assert payload["fix_skipped"] == {}
     assert payload["valid"] is True
+
+
+def test_fix_combined_keeps_block_scalar_spaces(tmp_path):
+    # Tab + trailing-tab fixes are needed together to parse; the block
+    # scalar's significant trailing spaces must survive that combined pass.
+    p = write(tmp_path, "msg: |\n  keep   \na:\n\tb: 1\t\n")
+    r = run("check", "--fix", p.name, cwd=tmp_path)
+    assert p.read_text() == "msg: |\n  keep   \na:\n  b: 1\n"
+    assert r.returncode == 0, r.stdout + r.stderr
+    import yaml
+
+    assert yaml.safe_load(p.read_text())["msg"] == "keep   \n"
+
+
+def test_fix_backup_keeps_permissions(tmp_path):
+    import os
+    import stat
+
+    p = write(tmp_path, "password: x   \n")
+    os.chmod(p, 0o600)
+    r = run("check", "--fix", "--backup", p.name, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    mode = stat.S_IMODE(os.stat(tmp_path / "f.yaml.bak").st_mode)
+    assert mode == 0o600
+
+
+def test_fix_recursive_alias_does_not_crash():
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("a: &x [*x]  \n")
+    assert result.content == "a: &x [*x]\n"
+
+
+def test_fix_many_lines_with_one_unsafe_is_fast():
+    import time
+
+    from yaml_validator.validator import fix_content
+
+    body = "".join(f"k{i}: {i}  \n" for i in range(2000))
+    text = "msg: |\n  keep   \n" + body
+    start = time.perf_counter()
+    result = fix_content(text)
+    assert time.perf_counter() - start < 10
+    assert result.fixed == {"trailing-spaces": 2000}
+    assert "  keep   \n" in result.content

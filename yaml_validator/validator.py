@@ -10,6 +10,7 @@ Provides:
 
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -246,23 +247,84 @@ def _load_all(content: str):
         return False, None
 
 
-def _unsafe_reason(content: str, candidate: str) -> Optional[str]:
-    """Why replacing *content* with *candidate* is unsafe, or None if safe."""
-    ok_before, before = _load_all(content)
-    ok_after, after = _load_all(candidate)
-    if not ok_after:
-        if ok_before:
-            return "would make the file invalid YAML"
-        return "file is not valid YAML, so the fix cannot be verified"
-    if ok_before and before != after and repr(before) != repr(after):
-        return "would change the parsed data"
-    return None
+def _same_data(a, b) -> bool:
+    """Compare parsed YAML, coping with NaN and self-referential aliases."""
+    try:
+        if a == b:
+            return True
+    except RecursionError:  # e.g. ``&a [*a]`` loads as a recursive list
+        pass
+    try:
+        return yaml.safe_dump_all(a) == yaml.safe_dump_all(b)
+    except (yaml.YAMLError, RecursionError):
+        return False
 
 
-def _apply_fix(content: str, fix_line) -> str:
-    if fix_line is None:  # end-of-file newline
-        return content + "\n" if content and not content.endswith("\n") else content
-    return "\n".join(fix_line(line) for line in content.split("\n"))
+def _with_edits(lines: List[str], edits: Dict[int, str]) -> str:
+    out = list(lines)
+    for i, new in edits.items():
+        out[i] = new
+    return "\n".join(out)
+
+
+def _keep_data_preserving(
+    lines: List[str], edits: Dict[int, str], data
+) -> Dict[int, str]:
+    """Return the subset of line *edits* that keeps the parsed data equal to *data*.
+
+    Edits are tried in bisected batches, so a document with k unsafe lines
+    costs O(k log n) parses rather than one parse per line.
+    """
+    accepted: Dict[int, str] = {}
+
+    def visit(group: List[int]) -> None:
+        trial = dict(accepted)
+        trial.update({i: edits[i] for i in group})
+        ok, parsed = _load_all(_with_edits(lines, trial))
+        if ok and _same_data(data, parsed):
+            accepted.update({i: edits[i] for i in group})
+        elif len(group) > 1:
+            mid = len(group) // 2
+            visit(group[:mid])
+            visit(group[mid:])
+
+    visit(sorted(edits))
+    return accepted
+
+
+def _revert_data_changing(original: List[str], fixed: List[str], data) -> List[str]:
+    """Undo edits in *fixed* (which parses to *data*) that changed the data.
+
+    Used when the original does not parse, so the fixes are needed together.
+    An edit is reverted when the file still parses without it, which means
+    the edit was not needed to make the file parse and it altered a value
+    (e.g. trailing spaces inside a ``|`` block scalar). Bisected like
+    :func:`_keep_data_preserving`.
+    """
+    result = list(fixed)
+    state = {"data": data}
+
+    def visit(group: List[int]) -> None:
+        trial = list(result)
+        for i in group:
+            trial[i] = original[i]
+        ok, parsed = _load_all("\n".join(trial))
+        if not ok and len(group) == 1:
+            return  # needed to make the file parse
+        if ok and _same_data(state["data"], parsed):
+            return  # only cosmetic edits in this group: keep them
+        if len(group) == 1:
+            result[group[0]] = original[group[0]]
+            state["data"] = parsed
+            return
+        mid = len(group) // 2
+        visit(group[:mid])
+        visit(group[mid:])
+
+    changed = [i for i, (a, b) in enumerate(zip(original, fixed)) if a != b]
+    if changed:
+        visit(changed)
+    return result
 
 
 def _count(check, content: str) -> int:
@@ -280,52 +342,53 @@ def fix_content(
     blank lines are left alone. A fix is kept only if it is provably safe:
     when the content already parses, the parsed data must be unchanged
     (e.g. trailing spaces inside a ``|`` block scalar are kept); when it
-    does not parse, the fixes must make it parse. Running it twice gives
+    does not parse, the fixes must make it parse, and any edit that is not
+    needed for that and changes a value is undone. Running it twice gives
     the same result as running it once.
     """
-    fixers = [("no-tabs", _check_tab_indentation, lambda ln: _fix_tab_line(ln, tab_width))]
+    line_fixers = [
+        ("no-tabs", _check_tab_indentation, lambda ln: _fix_tab_line(ln, tab_width))
+    ]
     if fix_trailing_spaces:
-        fixers.append(("trailing-spaces", _check_trailing_spaces, _fix_trailing_line))
-    fixers.append(("end-of-file-newline", _check_missing_newline, None))
+        line_fixers.append(
+            ("trailing-spaces", _check_trailing_spaces, _fix_trailing_line)
+        )
+    eof = ("end-of-file-newline", _check_missing_newline)
+    checks = [(rule, check) for rule, check, _ in line_fixers] + [eof]
 
-    result = FixResult(content=content)
-    for rule, check, fix_line in fixers:
-        current = result.content
-        candidate = _apply_fix(current, fix_line)
-        if candidate == current:
-            continue
-        reason = _unsafe_reason(current, candidate)
-        if reason and fix_line is not None and _load_all(current)[0]:
-            # Some lines are unsafe to touch (e.g. inside a block scalar):
-            # keep each line's fix only if it leaves the parsed data unchanged.
-            candidate = current
-            for i, line in enumerate(current.split("\n")):
-                lines = candidate.split("\n")
-                lines[i] = fix_line(line)
-                attempt = "\n".join(lines)
-                if attempt != candidate and _unsafe_reason(candidate, attempt) is None:
-                    candidate = attempt
-        elif reason:
-            candidate = current
-        left = _count(check, candidate)
-        if candidate != current:
-            result.fixed[rule] = _count(check, current) - left
-            result.content = candidate
-        if reason and left:
-            result.skipped[rule] = f"{left} not fixed: {reason}"
+    ok, data = _load_all(content)
+    new = content
+    if ok:
+        reason = "would change the parsed data"
+        for _, _, fix_line in line_fixers:
+            lines = new.split("\n")
+            edits = {i: fix_line(ln) for i, ln in enumerate(lines)}
+            edits = {i: v for i, v in edits.items() if v != lines[i]}
+            if edits:
+                new = _with_edits(lines, _keep_data_preserving(lines, edits, data))
+        if new and not new.endswith("\n"):
+            ok_eof, parsed = _load_all(new + "\n")
+            if ok_eof and _same_data(data, parsed):
+                new += "\n"
+    else:
+        reason = "file is not valid YAML, so the fix cannot be verified"
+        base = content + "\n" if content and not content.endswith("\n") else content
+        original = base.split("\n")
+        fixed = list(original)
+        for _, _, fix_line in line_fixers:
+            fixed = [fix_line(ln) for ln in fixed]
+        ok_fixed, fixed_data = _load_all("\n".join(fixed))
+        if ok_fixed:
+            new = "\n".join(_revert_data_changing(original, fixed, fixed_data))
+            reason = "would change the parsed data"
 
-    if result.skipped and not _load_all(result.content)[0]:
-        # No single fix makes the file parse; accept them together if that does.
-        combined = result.content
-        for _, _, fix_line in fixers:
-            combined = _apply_fix(combined, fix_line)
-        if _load_all(combined)[0]:
-            for rule, check, _ in fixers:
-                gained = _count(check, result.content) - _count(check, combined)
-                if gained:
-                    result.fixed[rule] = result.fixed.get(rule, 0) + gained
-            result.content = combined
-            result.skipped = {}
+    result = FixResult(content=new)
+    for rule, check in checks:
+        before, after = _count(check, content), _count(check, new)
+        if before > after:
+            result.fixed[rule] = before - after
+        if after:
+            result.skipped[rule] = f"{after} not fixed: {reason}"
     return result
 
 
@@ -350,7 +413,9 @@ def fix_file(
     )
     if result.fixed:
         if backup:
-            path.with_name(path.name + ".bak").write_bytes(raw)
+            # copy2 also copies the permission bits, so a 0600 config does
+            # not end up with a world-readable backup.
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
         newline = "\r\n" if b"\r\n" in raw else "\n"
         path.write_text(result.content, encoding="utf-8", newline=newline)
     return result
