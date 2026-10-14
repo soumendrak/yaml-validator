@@ -22,6 +22,7 @@
 
 - **Syntax validation** — catches malformed YAML with precise line/column reporting
 - **Style checks** — trailing whitespace, tab indentation, line length, missing EOF newlines
+- **Auto-fix** — `--fix` repairs tab indentation, trailing whitespace and missing EOF newlines in place, without touching comments or layout
 - **Schema validation** — validate YAML structure against a JSON Schema (or YAML schema) file
 - **Multi-document support** — handles YAML files with `---` separators
 - **Machine-readable output** — `--json` flag for CI/CD integration
@@ -65,14 +66,43 @@ yaml-validator check config.yaml --json
 
 # Lint (alias for check)
 yaml-validator lint config.yaml
+
+# Auto-fix style issues in place, then validate
+yaml-validator check config.yaml --fix
+
+# Keep a copy of the original as config.yaml.bak; indent tabs become 4 spaces
+yaml-validator check config.yaml --fix --backup --tab-width 4
 ```
+
+### Auto-fix (`--fix`)
+
+`--fix` (or `-f`, on `check` and `lint`) rewrites each file in place, then validates it and reports what is left:
+
+| Rule | Fix |
+|------|-----|
+| `no-tabs` | Tabs in the indentation of tab-indented lines become `--tab-width` spaces (default 2) |
+| `trailing-spaces` | Trailing whitespace is removed (skipped with `--no-trailing-spaces`) |
+| `end-of-file-newline` | A final newline is added |
+
+- Only whitespace is edited, so comments, quoting, key order, blank lines and CRLF line endings stay as they are.
+- A fix is applied only if it is safe. If the file parses, the parsed data must stay identical; for example, trailing spaces inside a `|` block scalar are kept. If the file does not parse, the fixes must make it parse; otherwise the file is left untouched.
+- Running `--fix` again changes nothing.
+- The file is only rewritten when something was fixed. `--backup` saves the original as `<file>.bak` first.
+
+```bash
+$ yaml-validator check bad.yaml --fix
+Fixed 1 issue(s) in bad.yaml (1 no-tabs)
+✓ bad.yaml
+```
+
+Fixes that were skipped are listed with the reason (`Skipped trailing-spaces fix in x.yaml: ...`). With `--json`, the output gains `fixed` and `fix_skipped` keys.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0    | All files valid |
-| 1    | One or more files invalid or errors encountered |
+| 1    | One or more files invalid or errors encountered (with `--fix`: a file is still invalid after fixing) |
 
 ## Examples
 
@@ -97,15 +127,17 @@ $ yaml-validator check config.yaml
 # bad.yaml
 server:
   host: localhost
-	port: 8080	# ← tab used for indentation
+	port: 8080
 ```
 
 ```bash
 $ yaml-validator check bad.yaml
+[ERROR] line 3:1: found character '\t' that cannot start any token
 [ERROR] line 3: Tab character used for indentation (YAML requires spaces)
 
 ✗ bad.yaml
    1 error(s)
+   1 warning(s)
 ```
 
 ## Schema Validation
@@ -159,7 +191,8 @@ yaml-validator/
 ├── yaml_validator/
 │   ├── __init__.py     # Package metadata
 │   ├── cli.py          # CLI entry point (argparse)
-│   └── validator.py    # Core validation engine
+│   └── validator.py    # Core validation engine and --fix logic
+├── tests/              # pytest suite
 ├── pyproject.toml      # Project metadata & build config
 ├── requirements.txt    # Dependency pins
 ├── LICENSE             # MIT License

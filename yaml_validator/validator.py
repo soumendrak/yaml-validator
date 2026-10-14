@@ -5,13 +5,14 @@ Provides:
   - parse_yaml()     — safe YAML load with detailed error reporting
   - validate_file()  — syntax + optional schema validation for a YAML file
   - ValidationResult — typed result with errors, warnings, metadata
+  - fix_content() / fix_file() — safe auto-fix for tabs, trailing spaces, EOF newline
 """
 
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import yaml
 from yaml.error import MarkedYAMLError
@@ -207,6 +208,152 @@ def _detect_tab_vs_space(
     elif isinstance(data, list):
         for i, item in enumerate(data):
             _detect_tab_vs_space(item, errors, f"{path}[{i}]")
+
+
+# ── Auto-fix ────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class FixResult:
+    """Outcome of auto-fixing one file's content."""
+
+    content: str
+    fixed: Dict[str, int] = field(default_factory=dict)  # rule -> issues fixed
+    skipped: Dict[str, str] = field(default_factory=dict)  # rule -> reason
+
+    @property
+    def total(self) -> int:
+        return sum(self.fixed.values())
+
+
+def _fix_tab_line(line: str, tab_width: int) -> str:
+    """Replace tabs in the leading indentation of a tab-indented line."""
+    if line.startswith("\t") and line.strip():
+        indent = len(line) - len(line.lstrip(" \t"))
+        return line[:indent].replace("\t", " " * tab_width) + line[indent:]
+    return line
+
+
+def _fix_trailing_line(line: str) -> str:
+    return line.rstrip() if line.strip() else line
+
+
+def _load_all(content: str):
+    """Return ``(ok, documents)``; ``ok`` is False if *content* does not parse."""
+    try:
+        return True, list(yaml.safe_load_all(content))
+    except yaml.YAMLError:
+        return False, None
+
+
+def _unsafe_reason(content: str, candidate: str) -> Optional[str]:
+    """Why replacing *content* with *candidate* is unsafe, or None if safe."""
+    ok_before, before = _load_all(content)
+    ok_after, after = _load_all(candidate)
+    if not ok_after:
+        if ok_before:
+            return "would make the file invalid YAML"
+        return "file is not valid YAML, so the fix cannot be verified"
+    if ok_before and before != after and repr(before) != repr(after):
+        return "would change the parsed data"
+    return None
+
+
+def _apply_fix(content: str, fix_line) -> str:
+    if fix_line is None:  # end-of-file newline
+        return content + "\n" if content and not content.endswith("\n") else content
+    return "\n".join(fix_line(line) for line in content.split("\n"))
+
+
+def _count(check, content: str) -> int:
+    found: List[ValidationError] = []
+    check(content, "", found)
+    return len(found)
+
+
+def fix_content(
+    content: str, tab_width: int = 2, fix_trailing_spaces: bool = True
+) -> FixResult:
+    """Fix tab indentation, trailing whitespace and a missing EOF newline.
+
+    Edits are line-based text edits, so comments, quoting, key order and
+    blank lines are left alone. A fix is kept only if it is provably safe:
+    when the content already parses, the parsed data must be unchanged
+    (e.g. trailing spaces inside a ``|`` block scalar are kept); when it
+    does not parse, the fixes must make it parse. Running it twice gives
+    the same result as running it once.
+    """
+    fixers = [("no-tabs", _check_tab_indentation, lambda ln: _fix_tab_line(ln, tab_width))]
+    if fix_trailing_spaces:
+        fixers.append(("trailing-spaces", _check_trailing_spaces, _fix_trailing_line))
+    fixers.append(("end-of-file-newline", _check_missing_newline, None))
+
+    result = FixResult(content=content)
+    for rule, check, fix_line in fixers:
+        current = result.content
+        candidate = _apply_fix(current, fix_line)
+        if candidate == current:
+            continue
+        reason = _unsafe_reason(current, candidate)
+        if reason and fix_line is not None and _load_all(current)[0]:
+            # Some lines are unsafe to touch (e.g. inside a block scalar):
+            # keep each line's fix only if it leaves the parsed data unchanged.
+            candidate = current
+            for i, line in enumerate(current.split("\n")):
+                lines = candidate.split("\n")
+                lines[i] = fix_line(line)
+                attempt = "\n".join(lines)
+                if attempt != candidate and _unsafe_reason(candidate, attempt) is None:
+                    candidate = attempt
+        elif reason:
+            candidate = current
+        left = _count(check, candidate)
+        if candidate != current:
+            result.fixed[rule] = _count(check, current) - left
+            result.content = candidate
+        if reason and left:
+            result.skipped[rule] = f"{left} not fixed: {reason}"
+
+    if result.skipped and not _load_all(result.content)[0]:
+        # No single fix makes the file parse; accept them together if that does.
+        combined = result.content
+        for _, _, fix_line in fixers:
+            combined = _apply_fix(combined, fix_line)
+        if _load_all(combined)[0]:
+            for rule, check, _ in fixers:
+                gained = _count(check, result.content) - _count(check, combined)
+                if gained:
+                    result.fixed[rule] = result.fixed.get(rule, 0) + gained
+            result.content = combined
+            result.skipped = {}
+    return result
+
+
+def fix_file(
+    path: Union[str, Path],
+    tab_width: int = 2,
+    fix_trailing_spaces: bool = True,
+    backup: bool = False,
+) -> FixResult:
+    """Apply :func:`fix_content` to *path* in place.
+
+    The file is only rewritten if something was fixed. CRLF line endings
+    are kept. With ``backup=True`` the original bytes are first saved to
+    ``<name>.bak`` (e.g. ``config.yaml.bak``).
+    """
+    path = Path(path)
+    raw = path.read_bytes()
+    result = fix_content(
+        path.read_text(encoding="utf-8"),
+        tab_width=tab_width,
+        fix_trailing_spaces=fix_trailing_spaces,
+    )
+    if result.fixed:
+        if backup:
+            path.with_name(path.name + ".bak").write_bytes(raw)
+        newline = "\r\n" if b"\r\n" in raw else "\n"
+        path.write_text(result.content, encoding="utf-8", newline=newline)
+    return result
 
 
 # ── High-level API ──────────────────────────────────────────────────────────

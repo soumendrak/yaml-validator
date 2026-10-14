@@ -3,6 +3,7 @@ yaml_validator/cli.py — CLI entry point for yaml-validator.
 
 Usage:
     yaml-validator check <file> [--schema SCHEMA] [flags]
+    yaml-validator check <file> --fix [--backup] [--tab-width N]
     yaml-validator --help
 """
 
@@ -10,7 +11,32 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .validator import validate_file
+from .validator import fix_file, validate_file
+
+
+def _add_fix_args(p) -> None:
+    """Add the auto-fix flags shared by ``check`` and ``lint``."""
+    p.add_argument(
+        "--fix",
+        "-f",
+        action="store_true",
+        default=False,
+        help="Fix tab indentation, trailing whitespace and a missing EOF newline "
+        "in place, then validate. Fixes that would change the parsed data are "
+        "skipped. Exits 1 if the file is still invalid.",
+    )
+    p.add_argument(
+        "--backup",
+        action="store_true",
+        default=False,
+        help="With --fix, save the original as <file>.bak before rewriting it.",
+    )
+    p.add_argument(
+        "--tab-width",
+        type=int,
+        default=2,
+        help="Spaces per indentation tab when fixing (default: 2).",
+    )
 
 
 def main() -> int:
@@ -89,6 +115,7 @@ def main() -> int:
         default=False,
         help="Output results as JSON (machine-readable).",
     )
+    _add_fix_args(check)
 
     # ── lint (alias for check) ──────────────────────────────────────────
     lint = sub.add_parser(
@@ -118,8 +145,11 @@ def main() -> int:
         dest="check_trailing_spaces",
         default=True,
     )
+    _add_fix_args(lint)
 
     args = parser.parse_args()
+    if args.tab_width < 1:
+        parser.error("--tab-width must be at least 1")
 
     # Normalise: "lint" -> "check"
     command = args.command  # noqa: F841
@@ -133,6 +163,15 @@ def main() -> int:
             print(f"Error: file not found — {p}", file=sys.stderr)
             exit_code = 1
             continue
+
+        fixes = None
+        if args.fix:
+            fixes = fix_file(
+                p,
+                tab_width=args.tab_width,
+                fix_trailing_spaces=getattr(args, "check_trailing_spaces", True),
+                backup=args.backup,
+            )
 
         result = validate_file(
             path=p,
@@ -148,8 +187,10 @@ def main() -> int:
             exit_code = 1
 
         if args.json:
-            _print_json(result)
+            _print_json(result, fixes)
         else:
+            if fixes is not None:
+                _print_fixes(result.path, fixes, quiet=args.quiet)
             _print_human(result, quiet=args.quiet)
 
     return exit_code
@@ -172,7 +213,16 @@ def _print_human(result, quiet: bool = False) -> None:
         print(result.summary)
 
 
-def _print_json(result) -> None:
+def _print_fixes(path: str, fixes, quiet: bool = False) -> None:
+    """Print what --fix changed and what it had to leave alone."""
+    if fixes.total and not quiet:
+        detail = ", ".join(f"{n} {rule}" for rule, n in fixes.fixed.items() if n)
+        print(f"Fixed {fixes.total} issue(s) in {path} ({detail})")
+    for rule, reason in fixes.skipped.items():
+        print(f"Skipped {rule} fix in {path}: {reason}")
+
+
+def _print_json(result, fixes=None) -> None:
     """Print validation result as JSON."""
     import json
 
@@ -201,6 +251,9 @@ def _print_json(result) -> None:
             for w in result.warnings
         ],
     }
+    if fixes is not None:
+        payload["fixed"] = {rule: n for rule, n in fixes.fixed.items() if n}
+        payload["fix_skipped"] = fixes.skipped
     json.dump(payload, sys.stdout, indent=2)
     print()
 
