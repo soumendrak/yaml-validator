@@ -533,7 +533,8 @@ def test_fix_file_keeps_extended_attributes(tmp_path):
     fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
     assert os.getxattr(p, "user.label") == b"keep-me"
-    assert os.getxattr(tmp_path / "f.yaml.bak", "user.label") == b"keep-me"
+    # The backup gets no xattrs at all.
+    assert os.listxattr(tmp_path / "f.yaml.bak") == []
 
 
 def test_fix_file_skips_xattrs_it_cannot_set(tmp_path, monkeypatch):
@@ -663,28 +664,6 @@ def test_fix_works_without_xattr_support(tmp_path, monkeypatch, err):
     assert (tmp_path / "f.yaml.bak").read_text() == "a: 1  \n"
 
 
-def test_partial_xattr_snapshot_skips_copy_and_strip(tmp_path, monkeypatch):
-    """If the source's xattrs can't all be read, none are copied or removed."""
-    import yaml_validator.validator as v
-
-    def denied(fd, name):
-        raise PermissionError("policy")
-
-    monkeypatch.setattr(v.os, "listxattr", lambda fd: ["security.x"], raising=False)
-    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
-    touched = []
-    monkeypatch.setattr(
-        v.os, "setxattr", lambda *a: touched.append(("set", a[1])), raising=False
-    )
-    monkeypatch.setattr(
-        v.os, "removexattr", lambda *a: touched.append(("rm", a[1])), raising=False
-    )
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p)
-    assert p.read_text() == "a: 1\n"
-    assert touched == []
-
-
 def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatch):
     from yaml_validator.cli import main
 
@@ -705,3 +684,296 @@ def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatc
     assert ".f.yaml." not in err
     assert "Traceback" not in err
     assert p.read_text() == "a: 1  \n"
+
+
+def test_unreadable_source_xattr_aborts_cleanly(tmp_path, monkeypatch):
+    """A partial snapshot (not ENOTSUP) must abort, naming the file."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    def denied(fd, name):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(v.os, "listxattr", lambda fd: ["security.x"], raising=False)
+    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="cannot read extended attributes") as info:
+        v.fix_file(p, backup=True)
+    assert info.value.filename == str(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_unsupported_source_xattrs_still_strip_inherited_acls(tmp_path, monkeypatch):
+    """Snapshot unavailable (ENOTSUP): copy nothing, keep other inherited
+    xattrs, but strip any inherited POSIX ACL."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    calls = {"n": 0}
+    removed, written = [], []
+
+    def listxattr(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:  # the source
+            raise OSError(errno.ENOTSUP, "Operation not supported")
+        return ["system.posix_acl_access", "security.selinux"]
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(
+        v.os, "removexattr", lambda fd, n: removed.append(n), raising=False
+    )
+    monkeypatch.setattr(
+        v.os, "setxattr", lambda *a: written.append(a[1]), raising=False
+    )
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+    assert removed == ["system.posix_acl_access"]
+    assert written == []
+
+
+def test_temp_listxattr_failure_aborts(tmp_path, monkeypatch):
+    """Y13: an unknown error listing the temp's xattrs must not be ignored."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    calls = {"n": 0}
+
+    def listxattr(fd):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="I/O error"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_failed_acl_strip_aborts(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    calls = {"n": 0}
+
+    def listxattr(fd):
+        calls["n"] += 1
+        return [] if calls["n"] == 1 else ["system.posix_acl_access"]
+
+    def refuse(fd, name):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v.os, "removexattr", refuse, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def _have_setfacl(path):
+    import shutil
+
+    if shutil.which("setfacl") is None:
+        return False
+    probe = subprocess.run(
+        ["setfacl", "-m", "u:nobody:r", str(path)], capture_output=True
+    )
+    return probe.returncode == 0
+
+
+def test_default_acl_does_not_widen_fixed_file_or_backup(tmp_path):
+    """Real repro: a dir with default ACL u:nobody:rw and a 0640 source that
+    predates it. The fixed file and .bak must not gain the nobody entry."""
+    import pwd
+
+    if not _have_setfacl(tmp_path):
+        pytest.skip("setfacl not available or ACLs unsupported here")
+    subprocess.run(["setfacl", "-b", str(tmp_path)], check=True)
+    p = write(tmp_path, "a: 1  \n")
+    p.chmod(0o640)
+    subprocess.run(["setfacl", "-d", "-m", "u:nobody:rw", str(tmp_path)], check=True)
+    from yaml_validator.validator import fix_file
+
+    nobody = pwd.getpwnam("nobody").pw_name
+
+    def acl(f):
+        out = subprocess.run(
+            ["getfacl", "-cp", str(f)], capture_output=True, text=True, check=True
+        ).stdout
+        return out
+
+    assert f"user:{nobody}" not in acl(p)
+    fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    assert f"user:{nobody}" not in acl(p)
+    assert f"user:{nobody}" not in acl(tmp_path / "f.yaml.bak")
+    assert stat.S_IMODE(p.stat().st_mode) == 0o640
+    assert stat.S_IMODE((tmp_path / "f.yaml.bak").stat().st_mode) == 0o600
+
+
+def test_backup_gets_no_xattrs_even_when_source_has_some(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    written = []
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {"user.k": b"v"})
+    monkeypatch.setattr(v.os, "listxattr", lambda fd: [], raising=False)
+    monkeypatch.setattr(
+        v.os, "setxattr", lambda fd, n, val: written.append(n), raising=False
+    )
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p, backup=True)
+    assert written == ["user.k"]  # the fixed file only, not the .bak
+
+
+def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
+    """Y6: only PermissionError from fchown is ignored."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    def broken(fd, uid, gid):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(v.os, "fchown", broken, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="I/O error"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_no_listxattr_platform_skips_xattrs(tmp_path, monkeypatch):
+    """Y5: without os.listxattr (Windows) the snapshot is None, not {}."""
+    import yaml_validator.validator as v
+
+    monkeypatch.delattr(v.os, "listxattr", raising=False)
+    assert v._read_xattrs(0) is None
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+
+
+def test_windows_chmod_fallback_sets_mode(tmp_path, monkeypatch):
+    """Y10: with no os.fchmod, the mode is applied with os.chmod."""
+    import yaml_validator.validator as v
+
+    monkeypatch.delattr(v.os, "fchmod", raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    p.chmod(0o640)
+    v.fix_file(p, backup=True)
+    assert stat.S_IMODE(p.stat().st_mode) == 0o640
+    assert stat.S_IMODE((tmp_path / "f.yaml.bak").stat().st_mode) == 0o600
+
+
+def test_cleanup_failure_keeps_the_original_error(tmp_path, monkeypatch):
+    """A temp that can't be deleted (e.g. read-only on Windows) must not
+    mask the error that aborted the fix."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    def full(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    def undeletable(path, *a, **k):
+        raise PermissionError(errno.EACCES, "Access is denied")
+
+    monkeypatch.setattr(v.os, "write", full)
+    monkeypatch.setattr(v.os, "unlink", undeletable)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="No space left") as info:
+        v.fix_file(p)
+    assert info.value.filename == str(p)
+
+
+def test_tab_only_line_is_not_a_tab_indentation_error():
+    """M13: a line holding only a tab is blank, not tab indentation."""
+    from yaml_validator.validator import _check_tab_indentation
+
+    errors = []
+    _check_tab_indentation("a: 1\n\t\nb: 2\n", "f.yaml", errors)
+    assert errors == []
+    _check_tab_indentation("a:\n\tb: 1\n", "f.yaml", errors)
+    assert [e.line for e in errors] == [2]
+
+
+def test_whitespace_only_line_is_left_as_is():
+    """M14: _fix_trailing_line leaves blank (whitespace-only) lines alone."""
+    from yaml_validator.validator import _fix_trailing_line
+
+    assert _fix_trailing_line("   ") == "   "
+    assert _fix_trailing_line("\t") == "\t"
+    assert _fix_trailing_line("a: 1  ") == "a: 1"
+
+
+def test_fix_content_empty_string_adds_no_newline():
+    """M17: empty content must not gain an EOF newline."""
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("")
+    assert result.content == ""
+    assert "end-of-file-newline" not in result.fixed
+    assert "end-of-file-newline" not in result.skipped
+
+
+def test_lone_cr_line_endings_are_normalised(tmp_path):
+    """N10: old-Mac CR-only files are read as separate lines."""
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_bytes(b"a: 1  \rb: 2\r")
+    result = fix_file(p)
+    assert result.fixed.get("trailing-spaces") == 1
+    assert p.read_bytes() == b"a: 1\nb: 2\n"
+
+
+def test_same_size_rewrite_is_detected(tmp_path, monkeypatch):
+    """N11: identity must include mtime/ctime, not just (dev, ino, size)."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def rewrite_same_size(*args, **kwargs):
+        with open(p, "w") as stream:
+            stream.write("z: 9  \n")  # same length, same inode
+        st = p.stat()
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", rewrite_same_size)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p)
+    assert p.read_text() == "z: 9  \n"
+
+
+def test_backup_dir_is_resolved_once(tmp_path, monkeypatch):
+    """X29: the .bak goes beside the file as resolved at the start, even if
+    a symlinked directory is retargeted mid-run."""
+    import yaml_validator.validator as v
+
+    real, other = tmp_path / "real", tmp_path / "other"
+    real.mkdir()
+    other.mkdir()
+    link = tmp_path / "dir"
+    link.symlink_to(real)
+    p = link / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def retarget(*args, **kwargs):
+        link.unlink()
+        link.symlink_to(other)
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", retarget)
+    v.fix_file(p, backup=True)
+    assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
+    assert not (other / "f.yaml.bak").exists()

@@ -8,6 +8,7 @@ Provides:
   - fix_content() / fix_file() — safe auto-fix for tabs, trailing spaces, EOF newline
 """
 
+import errno
 import os
 import stat
 import tempfile
@@ -420,8 +421,10 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
     """Best effort: the source's extended attributes, which hold POSIX ACLs
     (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
 
-    Returns None when they cannot all be read (including filesystems
-    without xattr support); the caller then skips copying xattrs.
+    Returns None only where xattrs are unsupported (no ``os.listxattr``, or
+    ENOTSUP/EOPNOTSUPP); then none are copied, but inherited ACLs are still
+    stripped. Any other failure raises: a partial snapshot could leave an
+    inherited ACL granting access the source never gave.
     """
     if not hasattr(os, "listxattr"):
         return None
@@ -429,9 +432,17 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
     try:
         for name in os.listxattr(fd):
             attrs[name] = os.getxattr(fd, name)
-    except OSError:
-        return None
+    except OSError as exc:
+        if exc.errno in _XATTR_UNSUPPORTED:
+            return None
+        raise
     return attrs
+
+
+_XATTR_UNSUPPORTED = {
+    getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP") if hasattr(errno, name)
+}
+_ACL_PREFIX = "system.posix_acl_"
 
 
 def _apply_metadata(
@@ -455,18 +466,26 @@ def _apply_metadata(
                 os.fchown(fd, uid, gid)
             except PermissionError:
                 pass
-    if attrs is not None:
+    if attrs is not None or hasattr(os, "listxattr"):
         try:
             inherited = os.listxattr(fd)
-        except OSError:
-            inherited = []
-        for name in inherited:  # e.g. an ACL inherited from the directory
-            if name not in attrs:
-                try:
-                    os.removexattr(fd, name)
-                except OSError:
-                    pass
-        for name, value in attrs.items():
+        except OSError as exc:
+            if exc.errno not in _XATTR_UNSUPPORTED:
+                raise
+            inherited = []  # no xattrs here, so nothing can be inherited
+        for name in inherited:  # e.g. an ACL inherited from a default ACL
+            if attrs is None:
+                # Unknown source xattrs: keep the rest, but never an ACL.
+                if not name.startswith(_ACL_PREFIX):
+                    continue
+            elif name in attrs:
+                continue
+            try:
+                os.removexattr(fd, name)
+            except OSError:
+                if name.startswith(_ACL_PREFIX):
+                    raise  # an inherited ACL left in place could widen access
+        for name, value in (attrs or {}).items():
             try:
                 os.setxattr(fd, name, value)
             except OSError:
@@ -523,7 +542,24 @@ def _atomic_write(
         raise
     finally:
         if temporary is not None:
-            Path(temporary).unlink(missing_ok=True)
+            _remove_quietly(temporary)
+
+
+def _remove_quietly(path: str) -> None:
+    """Delete a leftover temp file without masking the error in flight.
+
+    On Windows a read-only file cannot be deleted, so clear that bit first.
+    """
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def fix_file(
@@ -548,11 +584,20 @@ def fix_file(
     # Resolve once, then read and replace that same target, so a symlink
     # retargeted mid-run cannot redirect the write.
     target = Path(os.path.realpath(path))
+    # The .bak goes beside the given path, with its directory resolved now.
+    bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
     with open(target, "rb") as source:
         before = os.fstat(source.fileno())
         raw = source.read()
         info = os.fstat(source.fileno())
-        attrs = _read_xattrs(source.fileno())
+        try:
+            attrs = _read_xattrs(source.fileno())
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                f"cannot read extended attributes: {exc.strerror}",
+                str(target),
+            ) from exc
     if _identity(before) != _identity(info):
         # Written to while we read it: raw may mix old and new bytes.
         raise OSError(f"{target} changed while it was being read; not fixed")
@@ -564,13 +609,13 @@ def fix_file(
     )
     if result.fixed:
         if backup:
-            # Beside the given path, with its directory resolved once.
-            bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
             # Build the new backup in a temp file, then swap it in, so a
             # failed write leaves the previous backup intact. os.replace
             # replaces a planted .bak symlink rather than following it.
-            # The backup is private: 0600 and owned by the caller.
-            _atomic_write(bak, raw, info, attrs, 0o600, copy_owner=False)
+            # The backup is private: 0600, owned by the caller, and with no
+            # ACLs or other xattrs ({}: strip any it inherits).
+            bak_attrs = None if attrs is None else {}
+            _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
         newline = "\r\n" if b"\r\n" in raw else "\n"
         data = result.content.replace("\n", newline).encode("utf-8")
 
