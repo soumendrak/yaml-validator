@@ -552,3 +552,35 @@ def test_fix_file_skips_xattrs_it_cannot_set(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "setxattr", deny, raising=False)
     fix_file(p)
     assert p.read_text() == "a: 1\n"
+
+
+def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypatch):
+    """Caller is not the owner but is in the file's group (#10)."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    st = p.stat()
+    owner, group = st.st_uid + 1, st.st_gid + 1
+    real_fstat = os.fstat
+
+    def fake_fstat(fd):
+        r = real_fstat(fd)
+        return os.stat_result(
+            (r.st_mode, r.st_ino, r.st_dev, r.st_nlink, owner, group) + tuple(r)[6:]
+        )
+
+    calls = []
+
+    def fake_chown(path, uid, gid):
+        calls.append((Path(path).name.startswith("."), uid, gid))
+        if uid != -1:
+            raise PermissionError("only root may change the owner")
+
+    monkeypatch.setattr(v.os, "fstat", fake_fstat)
+    monkeypatch.setattr(v.os, "chown", fake_chown, raising=False)
+    monkeypatch.setattr(v, "_identity", lambda st: None)
+    v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    # bak temp, then fixed temp: group set first, then owner attempted.
+    assert calls == [(True, -1, group), (True, owner, -1)] * 2

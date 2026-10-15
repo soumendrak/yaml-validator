@@ -425,10 +425,13 @@ def _copy_owner(path: Union[str, Path], info: os.stat_result) -> None:
     """
     if not hasattr(os, "chown"):  # Windows
         return
-    try:
-        os.chown(path, info.st_uid, info.st_gid)
-    except PermissionError:
-        pass
+    # Group first: a non-owner in the file's group may set the group even
+    # though changing the owner needs root.
+    for uid, gid in ((-1, info.st_gid), (info.st_uid, -1)):
+        try:
+            os.chown(path, uid, gid)
+        except PermissionError:
+            pass
 
 
 def _copy_xattrs(src: Union[str, Path], dst: Union[str, Path]) -> None:
