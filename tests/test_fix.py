@@ -2,6 +2,7 @@
 
 import json
 import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -561,6 +562,8 @@ def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypa
 
     def fake_fstat(fd):
         r = real_fstat(fd)
+        if not stat.S_ISREG(r.st_mode):  # leave our private temp dir alone
+            return r
         return os.stat_result(
             (r.st_mode, r.st_ino, r.st_dev, r.st_nlink, owner, group) + tuple(r)[6:]
         )
@@ -741,3 +744,62 @@ def test_unbound_fallback_refuses_a_swapped_temp(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="while it was being written"):
         v.fix_file(p)
     assert p.read_text() == "a: 1  \n"
+
+
+def test_temp_xattr_listing_failure_aborts(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    if not hasattr(os, "listxattr"):
+        pytest.skip("no xattr support")
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {})
+
+    def fail(fd):
+        raise OSError(95, "Operation not supported")
+
+    monkeypatch.setattr(v.os, "listxattr", fail)
+    with pytest.raises(OSError, match="could not list its extended attributes"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+@pytest.mark.skipif(
+    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
+)
+def test_planted_temp_directory_is_rejected(tmp_path, monkeypatch):
+    """A directory swapped in between mkdir and open fails the 0700/owner check."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_mkdir = os.mkdir
+
+    def mkdir_then_swap(name, mode=0o777, **kwargs):
+        real_mkdir(name, mode, **kwargs)
+        moved = tmp_path / "moved"
+        os.rename(tmp_path / name, moved)
+        real_mkdir(tmp_path / name, 0o755)  # stand-in for an attacker's dir
+
+    monkeypatch.setattr(v.os, "mkdir", mkdir_then_swap)
+    with pytest.raises(OSError, match="was replaced before it could be opened"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_windows_temp_dir_is_restricted_before_313(monkeypatch):
+    import yaml_validator.validator as v
+
+    runs = []
+    monkeypatch.setattr(v.os, "name", "nt")
+    monkeypatch.setattr(v.sys, "version_info", (3, 12, 0))
+    monkeypatch.setenv("USERNAME", "alice")
+    monkeypatch.setattr(v.subprocess, "run", lambda cmd, **kw: runs.append(cmd))
+    v._restrict_windows_dir("C:/x/.yv-1")
+    assert runs == [
+        ["icacls", "C:/x/.yv-1", "/inheritance:r", "/grant:r", "alice:(OI)(CI)F"]
+    ]
+    monkeypatch.setattr(v.sys, "version_info", (3, 13, 0))
+    v._restrict_windows_dir("C:/x/.yv-2")
+    assert len(runs) == 1

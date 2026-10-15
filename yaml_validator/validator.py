@@ -11,6 +11,8 @@ Provides:
 import os
 import secrets
 import stat
+import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -458,8 +460,9 @@ def _apply_metadata(
     if attrs is not None and hasattr(os, "listxattr"):
         try:
             inherited = os.listxattr(fd)
-        except OSError:
-            inherited = []
+        except OSError as exc:
+            # Unknown inherited ACLs could be activated by the fchmod below.
+            raise OSError(f"{path}: could not list its extended attributes") from exc
         for name in inherited:  # e.g. an ACL inherited from the directory
             if name not in attrs:
                 try:
@@ -476,6 +479,21 @@ def _apply_metadata(
         os.fchmod(fd, mode)
     else:  # Windows
         os.chmod(path, mode)
+
+
+def _restrict_windows_dir(tmpdir: str) -> None:
+    """Make *tmpdir* private on Windows before Python 3.13, where the 0o700
+    mode passed by mkdtemp is not turned into a restrictive ACL."""
+    if os.name != "nt" or sys.version_info >= (3, 13):
+        return
+    user = os.environ.get("USERNAME")
+    if not user:
+        raise OSError(f"{tmpdir}: cannot make it private (USERNAME unset)")
+    subprocess.run(
+        ["icacls", tmpdir, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
+        check=True,
+        capture_output=True,
+    )
 
 
 def _atomic_write(
@@ -495,6 +513,7 @@ def _atomic_write(
     bound = os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd
     if not bound:  # e.g. Windows: plain paths
         tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
+        _restrict_windows_dir(tmpdir)
         name = os.path.join(tmpdir, "new")
         try:
             fd = os.open(name, _NEW_FLAGS, 0o600)
@@ -526,8 +545,17 @@ def _atomic_write(
         tmpdir = f".yv-{secrets.token_hex(8)}"
         os.mkdir(tmpdir, 0o700, dir_fd=pfd)
         try:
-            dfd = os.open(tmpdir, dir_flags, dir_fd=pfd)
+            dfd = os.open(tmpdir, dir_flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=pfd)
             try:
+                # Another user may rename our directory and plant a look-alike
+                # before the open, but cannot make one owned by us
+                # with no group/other access.
+                bound_dir = os.fstat(dfd)
+                if (
+                    bound_dir.st_uid != os.geteuid()
+                    or stat.S_IMODE(bound_dir.st_mode) & 0o077
+                ):
+                    raise OSError(f"{tmpdir} was replaced before it could be opened")
                 fd = os.open("new", _NEW_FLAGS, 0o600, dir_fd=dfd)
                 where = os.path.join(dest.parent, tmpdir, "new")
                 _write_new(fd, where, data, info, attrs)
