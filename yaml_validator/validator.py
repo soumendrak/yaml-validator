@@ -346,6 +346,8 @@ def fix_content(
     fixes that leave the parsed data unchanged. Invalid YAML is fixed only
     when replacing tabs (and dropping syntax-breaking trailing tabs) makes
     it parse."""
+    if tab_width < 1:
+        raise ValueError("tab_width must be at least 1")
     fix_tab: LineFixer = partial(_fix_tab_line, tab_width=tab_width)
     checks: list[tuple[str, Check]] = [("no-tabs", _check_tab_indentation)]
     fixers: list[LineFixer] = [fix_tab]
@@ -414,9 +416,7 @@ def _reject_inherited(fd: int, dest: Path) -> None:
 
 
 def _named(exc: OSError, dest: Path) -> OSError:
-    if exc.errno is None:
-        return exc
-    return type(exc)(exc.errno, exc.strerror, str(dest))
+    return exc if exc.errno is None else type(exc)(exc.errno, exc.strerror, str(dest))
 
 
 def _discard(path: str) -> None:
@@ -502,10 +502,10 @@ def fix_file(
     data = result.content.replace("\n", newline).encode("utf-8")
     temporary = _write_temp(target, data, info, stat.S_IMODE(info.st_mode), True)
     try:
-        _check_unchanged(target, info)
+        _check_unchanged(target, info, raw)
         if backup:
             _replace(_write_temp(bak, raw, info, 0o600, False), bak)
-            _check_unchanged(target, info)
+            _check_unchanged(target, info, raw)
     except OSError:
         _discard(temporary)
         raise
@@ -513,8 +513,8 @@ def fix_file(
     return result
 
 
-def _check_unchanged(target: Path, info: os.stat_result) -> None:
-    if _identity(os.stat(target)) != _identity(info):
+def _check_unchanged(target: Path, info: os.stat_result, raw: bytes) -> None:
+    if _identity(os.stat(target)) != _identity(info) or target.read_bytes() != raw:
         raise OSError(f"{target} changed while it was being fixed; not overwritten")
 
 

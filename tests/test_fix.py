@@ -1472,3 +1472,30 @@ def test_validate_missing_file_and_schema_errors(
     monkeypatch.setitem(sys.modules, "jsonschema", None)
     absent = validate_file(p, schema_path=schema)
     assert absent.errors[0].rule == "dependency"
+
+
+def test_fix_content_rejects_non_positive_tab_width() -> None:
+    from yaml_validator.validator import fix_content
+
+    with pytest.raises(ValueError, match="at least 1"):
+        fix_content("a:\n\tb: 1\n", 0)
+
+
+def test_same_size_rewrite_with_same_stat_is_detected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def rewrite(*args: object) -> v.FixResult:
+        result = real_fix_content(*args)
+        monkeypatch.setattr(v, "_identity", lambda st: (0, 0, 0, 0, 0))
+        p.write_text("z: 9  \n")
+        return result
+
+    monkeypatch.setattr(v, "fix_content", rewrite)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p)
+    assert p.read_text() == "z: 9  \n"
