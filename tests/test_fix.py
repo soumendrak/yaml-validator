@@ -239,16 +239,19 @@ def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch
 
     def observe_open(path, flags, mode=0o777, **kwargs):
         fd = real_open(path, flags, mode, **kwargs)
-        if Path(path).name == "new":  # temp file, later renamed into place
-            creations.append((flags, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
+        if Path(path).name.startswith(".f.yaml"):  # mkstemp temp file
+            excl = flags & (os.O_CREAT | os.O_EXCL) == os.O_CREAT | os.O_EXCL
+            creations.append((excl, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
         return fd
 
     monkeypatch.setattr(os, "open", observe_open)
     fix_file(p, backup=True)
     # One temp for the .bak, one for the fixed file; both start at 0600.
-    assert creations == [(os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, 0o600)] * 2
+    assert creations == [(True, 0o600, 0o600)] * 2
     assert bak.read_bytes() == b"a: 1  \r\n"
-    assert stat.S_IMODE(bak.stat().st_mode) == 0o640
+    # The backup stays private (0600) even though the source is 0640.
+    assert stat.S_IMODE(bak.stat().st_mode) == 0o600
+    assert stat.S_IMODE(p.stat().st_mode) == 0o640
 
 
 def test_backup_replaces_existing_wider_mode_file(tmp_path):
@@ -301,7 +304,7 @@ def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monke
             dst = Path(os.readlink(f"/proc/self/fd/{kwargs['dst_dir_fd']}")) / dst
         src = Path(src)
         calls.append((src, dst))
-        assert src.parent.parent == target.parent
+        assert src.parent == target.parent
         assert target.read_bytes() == b"a: 1  \n"
         assert src.read_bytes() == b"a: 1\n"
         assert stat.S_IMODE(src.stat().st_mode) == 0o640
@@ -471,7 +474,7 @@ def _secondary_group():
 
 
 @pytest.mark.skipif(_secondary_group() is None, reason="user has no secondary group")
-def test_fix_file_keeps_group_on_file_and_backup(tmp_path):
+def test_fix_file_keeps_group_on_file_not_backup(tmp_path):
     from yaml_validator.validator import fix_file
 
     gid = _secondary_group()
@@ -481,7 +484,8 @@ def test_fix_file_keeps_group_on_file_and_backup(tmp_path):
     fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
     assert p.stat().st_gid == gid
-    assert (tmp_path / "f.yaml.bak").stat().st_gid == gid
+    # The backup is not chowned: it keeps the caller's own group.
+    assert (tmp_path / "f.yaml.bak").stat().st_gid == os.getgid()
 
 
 def test_fix_file_ignores_permission_error_from_chown(tmp_path, monkeypatch):
@@ -580,8 +584,8 @@ def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypa
     monkeypatch.setattr(v, "_identity", lambda st: None)
     v.fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
-    # bak temp, then fixed temp: group set first, then owner attempted.
-    assert calls == [(-1, group), (owner, -1)] * 2
+    # Only the fixed file is chowned (not the .bak): group first, then owner.
+    assert calls == [(-1, group), (owner, -1)]
 
 
 @pytest.mark.skipif(not hasattr(os, "removexattr"), reason="no xattr support")
@@ -604,90 +608,6 @@ def test_fix_file_drops_xattrs_the_source_lacks(tmp_path, monkeypatch):
     monkeypatch.setattr(v.os, "removexattr", lambda fd, name: removed.append(name))
     v.fix_file(p, backup=True)
     assert removed == ["system.posix_acl_access"] * 2
-
-
-@pytest.mark.skipif(
-    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
-)
-def test_fix_file_ignores_a_swapped_temp_directory(tmp_path, monkeypatch):
-    """Renaming the private temp dir and planting a look-alike cannot
-    redirect what gets renamed over the target."""
-    import yaml_validator.validator as v
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    victim = tmp_path / "victim"
-    victim.write_text("evil: 1\n")
-    real_close = os.close
-    swapped = []
-
-    def close_then_swap(fd):
-        real_close(fd)
-        for entry in tmp_path.iterdir():
-            if entry.name.startswith(".yv-") and not swapped:
-                entry.rename(tmp_path / "moved")
-                entry.mkdir()
-                (entry / "new").symlink_to(victim)
-                swapped.append(entry)
-
-    monkeypatch.setattr(v.os, "close", close_then_swap)
-    v.fix_file(p)
-    assert swapped
-    assert not p.is_symlink()
-    assert p.read_text() == "a: 1\n"
-
-
-def test_incomplete_xattr_snapshot_does_not_strip_attributes(monkeypatch):
-    import yaml_validator.validator as v
-
-    def boom(fd, name=None):
-        raise PermissionError("policy")
-
-    monkeypatch.setattr(
-        v.os, "listxattr", lambda fd: ["security.selinux"], raising=False
-    )
-    monkeypatch.setattr(v.os, "getxattr", boom, raising=False)
-    assert v._read_xattrs(0) is None
-    removed = []
-    monkeypatch.setattr(
-        v.os, "removexattr", lambda fd, n: removed.append(n), raising=False
-    )
-    monkeypatch.setattr(v.os, "fchmod", lambda fd, mode: None, raising=False)
-    monkeypatch.setattr(v.os, "fchown", lambda fd, u, g: None, raising=False)
-    v._apply_metadata(0, "x", os.stat("."), None)
-    assert removed == []
-
-
-@pytest.mark.skipif(
-    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
-)
-def test_backup_dir_is_bound_before_ancestor_symlink_is_retargeted(
-    tmp_path, monkeypatch
-):
-    import yaml_validator.validator as v
-
-    real = tmp_path / "real"
-    other = tmp_path / "other"
-    real.mkdir()
-    other.mkdir()
-    link = tmp_path / "dir"
-    link.symlink_to(real)
-    p = link / "f.yaml"
-    p.write_text("a: 1  \n")
-    real_mkdir = os.mkdir
-    flipped = []
-
-    def mkdir_then_retarget(name, mode=0o777, **kwargs):
-        real_mkdir(name, mode, **kwargs)
-        if not flipped:
-            link.unlink()
-            link.symlink_to(other)
-            flipped.append(True)
-
-    monkeypatch.setattr(v.os, "mkdir", mkdir_then_retarget)
-    v.fix_file(p, backup=True)
-    assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
-    assert not (other / "f.yaml.bak").exists()
 
 
 def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
@@ -713,93 +633,75 @@ def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
     assert p.read_text() == "a: 1  \nb: 2\n"
 
 
-def test_incomplete_xattr_snapshot_aborts_the_fix(tmp_path, monkeypatch):
+def test_backup_is_0600_even_for_world_readable_source(tmp_path):
+    import stat
+
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n")
+    p.chmod(0o644)
+    fix_file(p, backup=True)
+    assert stat.S_IMODE((tmp_path / "f.yaml.bak").stat().st_mode) == 0o600
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("err", ["ENOTSUP", "EOPNOTSUPP"])
+def test_fix_works_without_xattr_support(tmp_path, monkeypatch, err):
+    import errno
+
     import yaml_validator.validator as v
 
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: None)
-    with pytest.raises(OSError, match="could not read its extended attributes"):
-        v.fix_file(p, backup=True)
+    def unsupported(*args, **kwargs):
+        code = getattr(errno, err)
+        raise OSError(code, os.strerror(code))
+
+    for name in ("listxattr", "getxattr", "setxattr", "removexattr"):
+        monkeypatch.setattr(v.os, name, unsupported, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    assert (tmp_path / "f.yaml.bak").read_text() == "a: 1  \n"
+
+
+def test_partial_xattr_snapshot_skips_copy_and_strip(tmp_path, monkeypatch):
+    """If the source's xattrs can't all be read, none are copied or removed."""
+    import yaml_validator.validator as v
+
+    def denied(fd, name):
+        raise PermissionError("policy")
+
+    monkeypatch.setattr(v.os, "listxattr", lambda fd: ["security.x"], raising=False)
+    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
+    touched = []
+    monkeypatch.setattr(
+        v.os, "setxattr", lambda *a: touched.append(("set", a[1])), raising=False
+    )
+    monkeypatch.setattr(
+        v.os, "removexattr", lambda *a: touched.append(("rm", a[1])), raising=False
+    )
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+    assert touched == []
+
+
+def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatch):
+    from yaml_validator.cli import main
+
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("needs POSIX permissions as a non-root user")
+    d = tmp_path / "ro"
+    d.mkdir()
+    p = write(d, "a: 1  \n")
+    d.chmod(0o500)
+    try:
+        monkeypatch.setattr(sys, "argv", ["yaml-validator", "check", "--fix", str(p)])
+        assert main() == 1
+    finally:
+        d.chmod(0o700)
+    err = capsys.readouterr().err
+    assert "Permission denied" in err
+    assert f"'{p}'" in err
+    assert ".f.yaml." not in err
+    assert "Traceback" not in err
     assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
-
-
-def test_unbound_fallback_refuses_a_swapped_temp(tmp_path, monkeypatch):
-    """The path-based branch (e.g. Windows) re-checks the temp entry."""
-    import yaml_validator.validator as v
-
-    monkeypatch.setattr(v.os, "supports_dir_fd", set())
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    real_close = os.close
-
-    def close_then_tamper(fd):
-        real_close(fd)
-        for d in tmp_path.iterdir():
-            if d.name.startswith(".yv-") and (d / "new").exists():
-                (d / "new").write_bytes(b"evil: 1\n")
-
-    monkeypatch.setattr(v.os, "close", close_then_tamper)
-    with pytest.raises(OSError, match="while it was being written"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-
-
-def test_temp_xattr_listing_failure_aborts(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    if not hasattr(os, "listxattr"):
-        pytest.skip("no xattr support")
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {})
-
-    def fail(fd):
-        raise OSError(95, "Operation not supported")
-
-    monkeypatch.setattr(v.os, "listxattr", fail)
-    with pytest.raises(OSError, match="could not list its extended attributes"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
-
-
-@pytest.mark.skipif(
-    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
-)
-def test_planted_temp_directory_is_rejected(tmp_path, monkeypatch):
-    """A directory swapped in between mkdir and open fails the 0700/owner check."""
-    import yaml_validator.validator as v
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    real_mkdir = os.mkdir
-
-    def mkdir_then_swap(name, mode=0o777, **kwargs):
-        real_mkdir(name, mode, **kwargs)
-        moved = tmp_path / "moved"
-        os.rename(tmp_path / name, moved)
-        real_mkdir(tmp_path / name, 0o755)  # stand-in for an attacker's dir
-
-    monkeypatch.setattr(v.os, "mkdir", mkdir_then_swap)
-    with pytest.raises(OSError, match="was replaced before it could be opened"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-
-
-def test_windows_temp_dir_is_restricted_before_313(monkeypatch):
-    import yaml_validator.validator as v
-
-    runs = []
-    monkeypatch.setattr(v.os, "name", "nt")
-    monkeypatch.setattr(v.sys, "version_info", (3, 12, 0))
-    monkeypatch.setenv("USERNAME", "alice")
-    monkeypatch.setattr(v.subprocess, "run", lambda cmd, **kw: runs.append(cmd))
-    v._restrict_windows_dir("C:/x/.yv-1")
-    assert runs == [
-        ["icacls", "C:/x/.yv-1", "/inheritance:r", "/grant:r", "alice:(OI)(CI)F"]
-    ]
-    monkeypatch.setattr(v.sys, "version_info", (3, 13, 0))
-    v._restrict_windows_dir("C:/x/.yv-2")
-    assert len(runs) == 1

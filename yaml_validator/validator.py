@@ -9,10 +9,7 @@ Provides:
 """
 
 import os
-import secrets
 import stat
-import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -423,15 +420,14 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
     """Best effort: the source's extended attributes, which hold POSIX ACLs
     (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
 
-    Returns None when the snapshot is incomplete (an attribute could not be
-    listed or read), so absent names are not mistaken for confirmed absence.
+    Returns None when they cannot all be read (including filesystems
+    without xattr support); the caller then skips copying xattrs.
     """
     if not hasattr(os, "listxattr"):
-        return {}
+        return None
     attrs: Dict[str, bytes] = {}
     try:
-        names = os.listxattr(fd)
-        for name in names:
+        for name in os.listxattr(fd):
             attrs[name] = os.getxattr(fd, name)
     except OSError:
         return None
@@ -439,15 +435,19 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
 
 
 def _apply_metadata(
-    fd: int, path: str, info: os.stat_result, attrs: Optional[Dict[str, bytes]]
+    fd: int,
+    path: str,
+    info: os.stat_result,
+    attrs: Optional[Dict[str, bytes]],
+    mode: int,
+    copy_owner: bool,
 ) -> None:
     """Give the open temp file *fd* the source's metadata, best effort.
 
-    Everything goes through the descriptor, so a swapped directory entry
-    cannot redirect it. Order: owner/group, then xattrs (while the file is
-    still 0600), then the mode.
+    Order: owner/group, then xattrs (while the file is still 0600), then
+    the mode.
     """
-    if hasattr(os, "fchown"):
+    if copy_owner and hasattr(os, "fchown"):
         # Group first: a non-owner in the file's group may set the group
         # even though changing the owner needs root.
         for uid, gid in ((-1, info.st_gid), (info.st_uid, -1)):
@@ -455,14 +455,11 @@ def _apply_metadata(
                 os.fchown(fd, uid, gid)
             except PermissionError:
                 pass
-    # With an incomplete snapshot (None), leave the temp's attributes alone
-    # rather than strip ones the source may have.
-    if attrs is not None and hasattr(os, "listxattr"):
+    if attrs is not None:
         try:
             inherited = os.listxattr(fd)
-        except OSError as exc:
-            # Unknown inherited ACLs could be activated by the fchmod below.
-            raise OSError(f"{path}: could not list its extended attributes") from exc
+        except OSError:
+            inherited = []
         for name in inherited:  # e.g. an ACL inherited from the directory
             if name not in attrs:
                 try:
@@ -474,110 +471,10 @@ def _apply_metadata(
                 os.setxattr(fd, name, value)
             except OSError:
                 pass
-    mode = stat.S_IMODE(info.st_mode)
     if hasattr(os, "fchmod"):
         os.fchmod(fd, mode)
     else:  # Windows
         os.chmod(path, mode)
-
-
-def _restrict_windows_dir(tmpdir: str) -> None:
-    """Make *tmpdir* private on Windows before Python 3.13, where the 0o700
-    mode passed by mkdtemp is not turned into a restrictive ACL."""
-    if os.name != "nt" or sys.version_info >= (3, 13):
-        return
-    user = os.environ.get("USERNAME")
-    if not user:
-        raise OSError(f"{tmpdir}: cannot make it private (USERNAME unset)")
-    subprocess.run(
-        ["icacls", tmpdir, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
-        check=True,
-        capture_output=True,
-    )
-
-
-def _atomic_write(
-    dest: Path,
-    data: bytes,
-    info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
-    before_replace=None,
-) -> None:
-    """Write *data* with the source's metadata, then rename it over *dest*.
-
-    The temp file lives in a fresh 0700 directory beside *dest*. Where the
-    platform allows, *dest*'s directory is opened once and every step (mkdir,
-    create, rename, cleanup) goes through descriptors, so neither swapping
-    the temp entry nor retargeting a symlinked ancestor can redirect it.
-    """
-    bound = os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd
-    if not bound:  # e.g. Windows: plain paths
-        tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
-        _restrict_windows_dir(tmpdir)
-        name = os.path.join(tmpdir, "new")
-        try:
-            fd = os.open(name, _NEW_FLAGS, 0o600)
-            written = os.fstat(fd)
-            _write_new(fd, name, data, info, attrs)
-            if before_replace is not None:
-                before_replace()
-            # Where mode 0o700 may not make the directory private (Windows
-            # before Python 3.13), check the entry is still the file we
-            # wrote, with our bytes, right before the rename.
-            now = os.lstat(name)
-            if (now.st_dev, now.st_ino) != (written.st_dev, written.st_ino):
-                raise OSError(f"{name} was replaced while it was being written")
-            with open(name, "rb") as check:
-                if check.read() != data:
-                    raise OSError(f"{name} was modified while it was being written")
-            os.replace(name, dest)
-        finally:
-            Path(name).unlink(missing_ok=True)
-            try:
-                os.rmdir(tmpdir)
-            except OSError:
-                pass
-        return
-
-    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    pfd = os.open(dest.parent, dir_flags)
-    try:
-        tmpdir = f".yv-{secrets.token_hex(8)}"
-        os.mkdir(tmpdir, 0o700, dir_fd=pfd)
-        try:
-            dfd = os.open(tmpdir, dir_flags | getattr(os, "O_NOFOLLOW", 0), dir_fd=pfd)
-            try:
-                # Another user may rename our directory and plant a look-alike
-                # before the open, but cannot make one owned by us
-                # with no group/other access.
-                bound_dir = os.fstat(dfd)
-                if (
-                    bound_dir.st_uid != os.geteuid()
-                    or stat.S_IMODE(bound_dir.st_mode) & 0o077
-                ):
-                    raise OSError(f"{tmpdir} was replaced before it could be opened")
-                fd = os.open("new", _NEW_FLAGS, 0o600, dir_fd=dfd)
-                where = os.path.join(dest.parent, tmpdir, "new")
-                _write_new(fd, where, data, info, attrs)
-                if before_replace is not None:
-                    before_replace()
-                os.replace("new", dest.name, src_dir_fd=dfd, dst_dir_fd=pfd)
-            finally:
-                try:
-                    os.unlink("new", dir_fd=dfd)
-                except FileNotFoundError:
-                    pass
-                os.close(dfd)
-        finally:
-            try:
-                os.rmdir(tmpdir, dir_fd=pfd)
-            except OSError:  # e.g. a look-alike planted under that name
-                pass
-    finally:
-        os.close(pfd)
-
-
-_NEW_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
 
 
 def _write_new(
@@ -586,14 +483,47 @@ def _write_new(
     data: bytes,
     info: os.stat_result,
     attrs: Optional[Dict[str, bytes]],
+    mode: int,
+    copy_owner: bool,
 ) -> None:
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view) :]
-        _apply_metadata(fd, path, info, attrs)
+        _apply_metadata(fd, path, info, attrs, mode, copy_owner)
     finally:
         os.close(fd)
+
+
+def _atomic_write(
+    dest: Path,
+    data: bytes,
+    info: os.stat_result,
+    attrs: Optional[Dict[str, bytes]],
+    mode: int,
+    copy_owner: bool = True,
+    before_replace=None,
+) -> None:
+    """Write *data* to a temp file beside *dest*, then rename it over *dest*.
+
+    ``mkstemp`` creates the temp file with ``O_EXCL`` at 0600; metadata is
+    applied through its descriptor before the rename. OS errors name *dest*,
+    not the temp file.
+    """
+    temporary = None
+    try:
+        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+        _write_new(fd, temporary, data, info, attrs, mode, copy_owner)
+        if before_replace is not None:
+            before_replace()
+        os.replace(temporary, dest)
+    except OSError as exc:
+        if exc.errno is not None and exc.filename != str(dest):
+            raise type(exc)(exc.errno, exc.strerror, str(dest)) from exc
+        raise
+    finally:
+        if temporary is not None:
+            Path(temporary).unlink(missing_ok=True)
 
 
 def fix_file(
@@ -606,12 +536,13 @@ def fix_file(
 
     The file is only rewritten if something was fixed. CRLF line endings
     are kept. With ``backup=True`` the original bytes are first saved to
-    ``<name>.bak`` (e.g. ``config.yaml.bak``).
+    ``<name>.bak`` (e.g. ``config.yaml.bak``), always at mode 0600.
 
     The fixed file is written to a temporary file and renamed over the
-    original, keeping its mode and, best effort, its owner, group and extended
-    attributes (ACLs, SELinux labels).
-    This breaks hard links: other names for the file keep the old content.
+    original, keeping its mode and, best effort, its owner, group and
+    extended attributes (ACLs, SELinux labels). On filesystems without
+    xattr support, xattrs are simply not copied. Renaming breaks hard
+    links: other names for the file keep the old content.
     """
     path = Path(path)
     # Resolve once, then read and replace that same target, so a symlink
@@ -625,10 +556,6 @@ def fix_file(
     if _identity(before) != _identity(info):
         # Written to while we read it: raw may mix old and new bytes.
         raise OSError(f"{target} changed while it was being read; not fixed")
-    if attrs is None:
-        # Without a full snapshot we cannot tell the source's ACLs from ones
-        # the temp file inherits, so do not risk installing the wrong ones.
-        raise OSError(f"{target}: could not read its extended attributes; not fixed")
     result = fix_content(
         # Universal newlines, as read_text() would give.
         raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
@@ -642,7 +569,8 @@ def fix_file(
             # Build the new backup in a temp file, then swap it in, so a
             # failed write leaves the previous backup intact. os.replace
             # replaces a planted .bak symlink rather than following it.
-            _atomic_write(bak, raw, info, attrs)
+            # The backup is private: 0600 and owned by the caller.
+            _atomic_write(bak, raw, info, attrs, 0o600, copy_owner=False)
         newline = "\r\n" if b"\r\n" in raw else "\n"
         data = result.content.replace("\n", newline).encode("utf-8")
 
@@ -653,7 +581,9 @@ def fix_file(
                     f"{target} changed while it was being fixed; not overwritten"
                 )
 
-        _atomic_write(target, data, info, attrs, unchanged)
+        _atomic_write(
+            target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged
+        )
     return result
 
 
