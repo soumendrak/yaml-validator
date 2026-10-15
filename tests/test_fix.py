@@ -238,7 +238,7 @@ def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch
 
     def observe_open(path, flags, mode=0o777, **kwargs):
         fd = real_open(path, flags, mode, **kwargs)
-        if Path(path) == bak:
+        if Path(path).name.startswith(".f.yaml.bak."):  # temp swapped in as .bak
             creations.append((flags, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
         return fd
 
@@ -432,3 +432,34 @@ def test_fix_file_refuses_when_target_rewritten_in_place(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="changed while it was being fixed"):
         fix_file(p)
     assert p.read_text() == "newer: 3\n"
+
+
+def test_failed_backup_write_keeps_old_backup(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    bak = tmp_path / "f.yaml.bak"
+    bak.write_text("old backup\n")
+    real_fdopen = os.fdopen
+
+    class FullDisk:
+        def __init__(self, fd, *a, **k):
+            self._f = real_fdopen(fd, *a, **k)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._f.close()
+
+        def write(self, data):
+            raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(v.os, "fdopen", FullDisk)
+    with pytest.raises(OSError, match="No space"):
+        fix_file(p, backup=True)
+    assert bak.read_text() == "old backup\n"
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml", "f.yaml.bak"]

@@ -9,6 +9,7 @@ Provides:
 """
 
 import os
+import secrets
 import stat
 import tempfile
 from dataclasses import dataclass, field
@@ -445,11 +446,18 @@ def fix_file(
         mode = stat.S_IMODE(info.st_mode)
         if backup:
             bak = path.with_name(path.name + ".bak")
-            bak.unlink(missing_ok=True)  # Remove symlinks rather than following them.
-            fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(raw)
-            os.chmod(bak, mode)
+            # Build the new backup beside the old one, then swap it in, so a
+            # failed write leaves the previous backup intact. os.replace
+            # replaces a planted .bak symlink rather than following it.
+            tmp_bak = bak.with_name(f".{bak.name}.{secrets.token_hex(8)}.tmp")
+            fd = os.open(tmp_bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(raw)
+                os.chmod(tmp_bak, mode)
+                os.replace(tmp_bak, bak)
+            finally:
+                tmp_bak.unlink(missing_ok=True)
         newline = "\r\n" if b"\r\n" in raw else "\n"
         fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         try:
