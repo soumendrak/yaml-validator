@@ -396,7 +396,8 @@ def fix_content(
             for i, ln in enumerate(tab_lines):
                 if _fix_trailing_line(ln) != ln:
                     trimmed[i] = _fix_trailing_line(ln)
-        add_eof = bool(content) and not content.endswith("\n")
+        # content is non-empty here: "" parses as valid YAML (None).
+        add_eof = not content.endswith("\n")
         candidate = "\n".join(trimmed.get(i, ln) for i, ln in enumerate(tab_lines))
         ok_fixed, fixed_data = _load_all(candidate + ("\n" if add_eof else ""))
         if ok_fixed:
