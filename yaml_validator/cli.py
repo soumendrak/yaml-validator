@@ -159,14 +159,18 @@ def main() -> int:
     exit_code = 0
 
     if args.fix and args.backup:
-        # A .bak must not land on another input (e.g. a.yaml and a.yaml.bak
-        # both given): that input would be overwritten before it is fixed.
-        targets = {os.path.realpath(f) for f in args.files}
+        # A .bak must not land on another input or the schema (e.g. a.yaml
+        # and a.yaml.bak both given, or --schema a.yaml.bak): that file
+        # would be overwritten before it is read.
+        protected = {os.path.realpath(f) for f in args.files}
+        schema = getattr(args, "schema", None)
+        if schema:
+            protected.add(os.path.realpath(schema))
         for f in args.files:
             bak = os.path.join(os.path.dirname(f) or ".", os.path.basename(f) + ".bak")
-            if os.path.realpath(bak) in targets:
+            if os.path.realpath(bak) in protected:
                 print(
-                    f"Error: backup {bak} would overwrite an input file",
+                    f"Error: backup {bak} would overwrite an input or schema file",
                     file=sys.stderr,
                 )
                 return 1

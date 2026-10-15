@@ -489,6 +489,7 @@ def test_fix_file_keeps_group_on_file_not_backup(tmp_path):
 
 
 def test_fix_file_ignores_permission_error_from_chown(tmp_path, monkeypatch):
+    """A group chown that fails is fine when the temp already has that group."""
     from yaml_validator.validator import fix_file
 
     def deny(*args, **kwargs):
@@ -497,8 +498,10 @@ def test_fix_file_ignores_permission_error_from_chown(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "fchown", deny, raising=False)
     p = tmp_path / "f.yaml"
     p.write_text("a: 1  \n")
+    gid = p.stat().st_gid
     fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
+    assert p.stat().st_gid == gid
 
 
 def test_valid_block_scalar_without_eof_newline_is_not_rewritten(tmp_path):
@@ -588,6 +591,43 @@ def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypa
     assert p.read_text() == "a: 1\n"
     # Only the fixed file is chowned (not the .bak): group first, then owner.
     assert calls == [(-1, group), (owner, -1)]
+
+
+def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
+    """Caller owns the file but cannot set its group onto the replacement.
+
+    The temp inherits a different group; installing it would keep that group
+    while restoring the source mode. The original must stay untouched.
+    """
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    before = p.stat()
+    foreign_gid = before.st_gid + 1
+    real_fstat = os.fstat
+
+    def fake_fstat(fd):
+        r = real_fstat(fd)
+        if r.st_ino == before.st_ino and stat.S_ISREG(r.st_mode):
+            return os.stat_result(
+                (r.st_mode, r.st_ino, r.st_dev, r.st_nlink, r.st_uid, foreign_gid)
+                + tuple(r)[6:]
+            )
+        return r
+
+    def fake_fchown(fd, uid, gid):
+        if gid != -1:
+            raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(v.os, "fstat", fake_fstat)
+    monkeypatch.setattr(v.os, "fchown", fake_fchown, raising=False)
+    with pytest.raises(OSError, match="could not preserve the file's group") as info:
+        v.fix_file(p, backup=True)
+    assert info.value.filename == os.path.realpath(p)
+    assert p.read_text() == "a: 1  \n"
+    assert p.stat().st_gid == before.st_gid
+    assert p.stat().st_mode == before.st_mode
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
 @pytest.mark.skipif(not hasattr(os, "removexattr"), reason="no xattr support")
@@ -834,7 +874,7 @@ def test_backup_gets_no_xattrs_even_when_source_has_some(tmp_path, monkeypatch):
 
 
 def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
-    """Y6: only PermissionError from fchown is ignored."""
+    """A non-permission fchown failure still aborts the fix."""
     import errno
 
     import yaml_validator.validator as v
@@ -1316,9 +1356,73 @@ def test_backup_onto_another_input_is_refused(tmp_path):
     b = write(tmp_path, "b: 1  \n", name="a.yaml.bak")
     r = run("check", "--fix", "--backup", str(a), str(b), cwd=tmp_path)
     assert r.returncode == 1
-    assert "would overwrite an input file" in r.stderr
+    assert "would overwrite an input or schema file" in r.stderr
     assert a.read_text() == "a: 1  \n"
     assert b.read_text() == "b: 1  \n"
+
+
+def test_backup_onto_schema_is_refused(tmp_path):
+    """--schema pointing at an input's .bak must not be replaced."""
+    a = write(tmp_path, "a: 1  \n", name="a.yaml")
+    earlier = write(tmp_path, "z: 1  \n", name="z.yaml")
+    schema = write(tmp_path, "type: object\n", name="a.yaml.bak")
+    r = run(
+        "check",
+        "--fix",
+        "--backup",
+        "--schema",
+        "a.yaml.bak",
+        "z.yaml",
+        "a.yaml",
+        cwd=tmp_path,
+    )
+    assert r.returncode == 1
+    assert "would overwrite an input or schema file" in r.stderr
+    assert "a.yaml.bak" in r.stderr
+    # Nothing is written, including an earlier input whose .bak is free.
+    assert earlier.read_text() == "z: 1  \n"
+    assert a.read_text() == "a: 1  \n"
+    assert schema.read_text() == "type: object\n"
+    assert not (tmp_path / "z.yaml.bak").exists()
+
+
+def test_backup_onto_schema_symlink_is_refused(tmp_path):
+    a = write(tmp_path, "a: 1  \n", name="a.yaml")
+    schema = write(tmp_path, "type: object\n", name="schema.yaml")
+    link = tmp_path / "a.yaml.bak"
+    link.symlink_to(schema.name)
+    r = run(
+        "check",
+        "--fix",
+        "--backup",
+        "--schema",
+        str(link),
+        str(a),
+        cwd=tmp_path,
+    )
+    assert r.returncode == 1
+    assert "would overwrite an input or schema file" in r.stderr
+    assert a.read_text() == "a: 1  \n"
+    assert schema.read_text() == "type: object\n"
+    assert link.is_symlink()
+
+
+def test_unrelated_schema_is_not_a_backup_collision(tmp_path):
+    a = write(tmp_path, "a: 1  \n", name="a.yaml")
+    schema = write(tmp_path, "type: object\n", name="schema.yaml")
+    r = run(
+        "check",
+        "--fix",
+        "--backup",
+        "--schema",
+        "schema.yaml",
+        "a.yaml",
+        cwd=tmp_path,
+    )
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert a.read_text() == "a: 1\n"
+    assert schema.read_text() == "type: object\n"
+    assert (tmp_path / "a.yaml.bak").read_text() == "a: 1  \n"
 
 
 def test_ima_signed_file_is_refused(tmp_path, monkeypatch):

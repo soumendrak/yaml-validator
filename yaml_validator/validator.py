@@ -467,19 +467,32 @@ def _apply_metadata(
     mode: int,
     copy_owner: bool,
 ) -> None:
-    """Give the open temp file *fd* the source's metadata, best effort.
+    """Give the open temp file *fd* the source's metadata.
 
-    Order: owner/group, then xattrs (while the file is still 0600), then
-    the mode.
+    Order: group, then owner, then xattrs (while the file is still 0600),
+    then the mode. The source group must be on the temp before it is
+    renamed into place; owner restoration is best effort.
     """
     if copy_owner and hasattr(os, "fchown"):
-        # Group first: a non-owner in the file's group may set the group
-        # even though changing the owner needs root.
-        for uid, gid in ((-1, info.st_gid), (info.st_uid, -1)):
-            try:
-                os.fchown(fd, uid, gid)
-            except PermissionError:
-                pass
+        # Group first: a caller in the file's group may set the group even
+        # though changing the owner needs extra privileges. Restoring the
+        # source mode onto a different group can take access from the
+        # intended group and give it to the temp's group, so a group change
+        # that does not stick aborts the fix. PermissionError is harmless
+        # only when the temp already has the source group (a no-op chown).
+        try:
+            os.fchown(fd, -1, info.st_gid)
+        except PermissionError as exc:
+            if os.fstat(fd).st_gid != info.st_gid:
+                raise OSError(
+                    errno.EPERM,
+                    "could not preserve the file's group; not fixed",
+                    path,
+                ) from exc
+        try:
+            os.fchown(fd, info.st_uid, -1)
+        except PermissionError:
+            pass
     if attrs is not None or hasattr(os, "listxattr"):
         try:
             inherited = os.listxattr(fd)
@@ -602,10 +615,12 @@ def fix_file(
     ``<name>.bak`` (e.g. ``config.yaml.bak``), always at mode 0600.
 
     The fixed file is written to a temporary file and renamed over the
-    original, keeping its mode and, best effort, its owner, group and
-    extended attributes (ACLs, SELinux labels). On filesystems without
-    xattr support, xattrs are simply not copied. Renaming breaks hard
-    links: other names for the file keep the old content.
+    original, keeping its mode and group and, best effort, its owner and
+    extended attributes (ACLs, SELinux labels). If the group cannot be
+    restored, the fix is aborted and the original is left unchanged. On
+    filesystems without xattr support, xattrs are simply not copied.
+    Renaming breaks hard links: other names for the file keep the old
+    content.
 
     With ``backup=True``, the .bak is written just before the final rename.
     If the target is then found to have changed (a concurrent writer), the
