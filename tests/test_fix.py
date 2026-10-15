@@ -525,72 +525,10 @@ def _xattrs_supported(path):
     return True
 
 
-def test_fix_file_keeps_extended_attributes(tmp_path):
-    from yaml_validator.validator import fix_file
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    if not _xattrs_supported(p):
-        pytest.skip("filesystem has no user xattr support")
-    os.setxattr(p, "user.label", b"keep-me")
-    fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
-    assert os.getxattr(p, "user.label") == b"keep-me"
-    # The backup gets no xattrs at all.
-    assert os.listxattr(tmp_path / "f.yaml.bak") == []
 
 
-def test_fix_file_skips_xattrs_it_cannot_set(tmp_path, monkeypatch):
-    from yaml_validator.validator import fix_file
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    monkeypatch.setattr(
-        os, "listxattr", lambda path: ["security.selinux"], raising=False
-    )
-    monkeypatch.setattr(os, "getxattr", lambda path, name: b"x", raising=False)
-
-    def deny(*args):
-        raise PermissionError("no")
-
-    monkeypatch.setattr(os, "setxattr", deny, raising=False)
-    with pytest.warns(RuntimeWarning, match="could not copy xattr security.selinux"):
-        fix_file(p)
-    assert p.read_text() == "a: 1\n"
 
 
-def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypatch):
-    """Caller is not the owner but is in the file's group (#10)."""
-    import yaml_validator.validator as v
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    st = p.stat()
-    owner, group = st.st_uid + 1, st.st_gid + 1
-    real_fstat = os.fstat
-
-    def fake_fstat(fd):
-        r = real_fstat(fd)
-        if not stat.S_ISREG(r.st_mode):  # leave our private temp dir alone
-            return r
-        return os.stat_result(
-            (r.st_mode, r.st_ino, r.st_dev, r.st_nlink, owner, group) + tuple(r)[6:]
-        )
-
-    calls = []
-
-    def fake_fchown(fd, uid, gid):
-        calls.append((uid, gid))
-        if uid != -1:
-            raise PermissionError("only root may change the owner")
-
-    monkeypatch.setattr(v.os, "fstat", fake_fstat)
-    monkeypatch.setattr(v.os, "fchown", fake_fchown, raising=False)
-    monkeypatch.setattr(v, "_identity", lambda st: None)
-    v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
-    # Only the fixed file is chowned (not the .bak): group first, then owner.
-    assert calls == [(-1, group), (owner, -1)]
 
 
 def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
@@ -630,26 +568,6 @@ def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-@pytest.mark.skipif(not hasattr(os, "removexattr"), reason="no xattr support")
-def test_fix_file_drops_xattrs_the_source_lacks(tmp_path, monkeypatch):
-    """An ACL inherited from the directory must not survive on the temp."""
-    import yaml_validator.validator as v
-
-    p = tmp_path / "f.yaml"
-    p.write_text("a: 1  \n")
-    removed = []
-    real_listxattr = os.listxattr
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {})
-    monkeypatch.setattr(
-        v.os,
-        "listxattr",
-        lambda fd: ["system.posix_acl_access"]
-        if isinstance(fd, int)
-        else real_listxattr(fd),
-    )
-    monkeypatch.setattr(v.os, "removexattr", lambda fd, name: removed.append(name))
-    v.fix_file(p, backup=True)
-    assert removed == ["system.posix_acl_access"] * 2
 
 
 def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
@@ -687,22 +605,6 @@ def test_backup_is_0600_even_for_world_readable_source(tmp_path):
     assert stat.S_IMODE(p.stat().st_mode) == 0o644
 
 
-@pytest.mark.parametrize("err", ["ENOTSUP", "EOPNOTSUPP"])
-def test_fix_works_without_xattr_support(tmp_path, monkeypatch, err):
-    import errno
-
-    import yaml_validator.validator as v
-
-    def unsupported(*args, **kwargs):
-        code = getattr(errno, err)
-        raise OSError(code, os.strerror(code))
-
-    for name in ("listxattr", "getxattr", "setxattr", "removexattr"):
-        monkeypatch.setattr(v.os, name, unsupported, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
-    assert (tmp_path / "f.yaml.bak").read_text() == "a: 1  \n"
 
 
 def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatch):
@@ -727,95 +629,12 @@ def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatc
     assert p.read_text() == "a: 1  \n"
 
 
-def test_unreadable_source_xattr_aborts_cleanly(tmp_path, monkeypatch):
-    """A partial snapshot (not ENOTSUP) must abort, naming the file."""
-    import errno
-
-    import yaml_validator.validator as v
-
-    def denied(fd, name):
-        raise PermissionError(errno.EACCES, "Permission denied")
-
-    monkeypatch.setattr(v.os, "listxattr", lambda fd: ["security.x"], raising=False)
-    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="cannot read extended attributes") as info:
-        v.fix_file(p, backup=True)
-    assert info.value.filename == str(p)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-def test_unsupported_source_xattrs_still_strip_inherited_acls(tmp_path, monkeypatch):
-    """Snapshot unavailable (ENOTSUP): copy nothing, keep other inherited
-    xattrs, but strip any inherited POSIX ACL."""
-    import errno
-
-    import yaml_validator.validator as v
-
-    calls = {"n": 0}
-    removed, written = [], []
-
-    def listxattr(fd):
-        calls["n"] += 1
-        if calls["n"] == 1:  # the source
-            raise OSError(errno.ENOTSUP, "Operation not supported")
-        return ["system.posix_acl_access", "security.selinux"]
-
-    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
-    monkeypatch.setattr(
-        v.os, "removexattr", lambda fd, n: removed.append(n), raising=False
-    )
-    monkeypatch.setattr(
-        v.os, "setxattr", lambda *a: written.append(a[1]), raising=False
-    )
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p)
-    assert p.read_text() == "a: 1\n"
-    assert removed == ["system.posix_acl_access"]
-    assert written == []
 
 
-def test_temp_listxattr_failure_aborts(tmp_path, monkeypatch):
-    """Y13: an unknown error listing the temp's xattrs must not be ignored."""
-    import errno
-
-    import yaml_validator.validator as v
-
-    calls = {"n": 0}
-
-    def listxattr(fd):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return []
-        raise OSError(errno.EIO, "I/O error")
-
-    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="I/O error"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-def test_failed_acl_strip_aborts(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    calls = {"n": 0}
-
-    def listxattr(fd):
-        calls["n"] += 1
-        return [] if calls["n"] == 1 else ["system.posix_acl_access"]
-
-    def refuse(fd, name):
-        raise PermissionError("no")
-
-    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
-    monkeypatch.setattr(v.os, "removexattr", refuse, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
 
 
 def _have_setfacl(path):
@@ -829,48 +648,8 @@ def _have_setfacl(path):
     return probe.returncode == 0
 
 
-def test_default_acl_does_not_widen_fixed_file_or_backup(tmp_path):
-    """Real repro: a dir with default ACL u:nobody:rw and a 0640 source that
-    predates it. The fixed file and .bak must not gain the nobody entry."""
-    import pwd
-
-    if not _have_setfacl(tmp_path):
-        pytest.skip("setfacl not available or ACLs unsupported here")
-    subprocess.run(["setfacl", "-b", str(tmp_path)], check=True)
-    p = write(tmp_path, "a: 1  \n")
-    p.chmod(0o640)
-    subprocess.run(["setfacl", "-d", "-m", "u:nobody:rw", str(tmp_path)], check=True)
-    from yaml_validator.validator import fix_file
-
-    nobody = pwd.getpwnam("nobody").pw_name
-
-    def acl(f):
-        out = subprocess.run(
-            ["getfacl", "-cp", str(f)], capture_output=True, text=True, check=True
-        ).stdout
-        return out
-
-    assert f"user:{nobody}" not in acl(p)
-    fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
-    assert f"user:{nobody}" not in acl(p)
-    assert f"user:{nobody}" not in acl(tmp_path / "f.yaml.bak")
-    assert stat.S_IMODE(p.stat().st_mode) == 0o640
-    assert stat.S_IMODE((tmp_path / "f.yaml.bak").stat().st_mode) == 0o600
 
 
-def test_backup_gets_no_xattrs_even_when_source_has_some(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    written = []
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {"user.k": b"v"})
-    monkeypatch.setattr(v.os, "listxattr", lambda fd: [], raising=False)
-    monkeypatch.setattr(
-        v.os, "setxattr", lambda fd, n, val: written.append(n), raising=False
-    )
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p, backup=True)
-    assert written == ["user.k"]  # the fixed file only, not the .bak
 
 
 def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
@@ -889,15 +668,6 @@ def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
     assert p.read_text() == "a: 1  \n"
 
 
-def test_no_listxattr_platform_skips_xattrs(tmp_path, monkeypatch):
-    """Y5: without os.listxattr (Windows) the snapshot is None, not {}."""
-    import yaml_validator.validator as v
-
-    monkeypatch.delattr(v.os, "listxattr", raising=False)
-    assert v._read_xattrs(0) is None
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
 
 
 def test_windows_chmod_fallback_sets_mode(tmp_path, monkeypatch):
@@ -1020,26 +790,6 @@ def test_backup_dir_is_resolved_once(tmp_path, monkeypatch):
     assert not (other / "f.yaml.bak").exists()
 
 
-def test_unchanged_file_with_unreadable_xattrs_succeeds(tmp_path, monkeypatch):
-    """No rewrite means no xattr snapshot, so unreadable xattrs don't matter."""
-    import errno
-
-    import yaml_validator.validator as v
-
-    def denied(*args):
-        raise PermissionError(errno.EACCES, "Permission denied")
-
-    monkeypatch.setattr(v.os, "listxattr", denied, raising=False)
-    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
-    p = write(tmp_path, "a: 1\n")
-    result = v.fix_file(p, backup=True)
-    assert result.fixed == {}
-    assert p.read_text() == "a: 1\n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
-    monkeypatch.setattr(sys, "argv", ["yaml-validator", "check", "--fix", str(p)])
-    from yaml_validator.cli import main
-
-    assert main() == 0
 
 
 def _fake_xattrs(monkeypatch, v, source, inherited):
@@ -1065,87 +815,16 @@ def _fake_xattrs(monkeypatch, v, source, inherited):
     return temps
 
 
-def test_acl_set_failure_aborts_without_installing_inherited_acl(tmp_path, monkeypatch):
-    import errno
-
-    import yaml_validator.validator as v
-
-    acl = "system.posix_acl_access"
-    temps = _fake_xattrs(monkeypatch, v, {acl: b"source"}, {acl: b"inherited"})
-
-    def no_space(fd, name, value):
-        assert acl not in temps[os.fstat(fd).st_ino], "inherited ACL stripped first"
-        raise OSError(errno.ENOSPC, "No space left on device")
-
-    monkeypatch.setattr(v.os, "setxattr", no_space, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="No space left"):
-        v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-def test_inherited_acl_is_replaced_by_the_source_acl(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    acl = "system.posix_acl_access"
-    temps = _fake_xattrs(monkeypatch, v, {acl: b"source"}, {acl: b"inherited"})
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1\n"
-    # The fixed file's temp (source ACL), then the .bak's ({}).
-    assert list(temps.values()) == [{acl: b"source"}, {}]
 
 
-def test_failure_stripping_non_acl_xattr_is_tolerated(tmp_path, monkeypatch):
-    """Z12: only ACL strip failures abort; others warn and continue."""
-    import yaml_validator.validator as v
-
-    _fake_xattrs(monkeypatch, v, {}, {"security.selinux": b"ctx"})
-
-    def refuse(fd, name):
-        raise PermissionError("no")
-
-    monkeypatch.setattr(v.os, "removexattr", refuse, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.warns(RuntimeWarning, match="could not remove inherited xattr"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1\n"
 
 
-def test_non_acl_setxattr_failure_warns(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    _fake_xattrs(monkeypatch, v, {"user.k": b"v"}, {})
-
-    def refuse(fd, name, value):
-        raise PermissionError("no")
-
-    monkeypatch.setattr(v.os, "setxattr", refuse, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.warns(RuntimeWarning, match="could not copy xattr user.k"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1\n"
 
 
-def test_other_system_xattrs_are_not_treated_as_acls(tmp_path, monkeypatch):
-    """Z14: the prefix is system.posix_acl_, not all of system.*."""
-    import yaml_validator.validator as v
-
-    temps = _fake_xattrs(monkeypatch, v, None, {"system.nfs4_acl": b"x"})
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p)
-    assert list(temps.values()) == [{"system.nfs4_acl": b"x"}]
 
 
-def test_backup_drops_inherited_non_acl_xattrs(tmp_path, monkeypatch):
-    """Z16: the .bak gets {} (strip everything), not None (strip ACLs only)."""
-    import yaml_validator.validator as v
-
-    temps = _fake_xattrs(monkeypatch, v, {}, {"user.inherited": b"x"})
-    p = write(tmp_path, "a: 1  \n")
-    v.fix_file(p, backup=True)
-    assert list(temps.values()) == [{}, {}]
 
 
 def test_identity_includes_ctime(tmp_path, monkeypatch):
@@ -1226,15 +905,14 @@ def test_target_rechecked_after_backup_write(tmp_path, monkeypatch):
 
     p = tmp_path / "f.yaml"
     p.write_text("a: 1  \n")
-    real_atomic_write = v._atomic_write
+    real_replace = v._replace
 
-    def write_then_touch(dest, *args, **kwargs):
-        real_atomic_write(dest, *args, **kwargs)
+    def replace_then_touch(temporary: str, dest: Path) -> None:
+        real_replace(temporary, dest)
         if dest.name == "f.yaml.bak":
-            with open(p, "w") as stream:  # a writer lands during the backup
-                stream.write("newer: 1\n")
+            p.write_text("newer: 1\n")
 
-    monkeypatch.setattr(v, "_atomic_write", write_then_touch)
+    monkeypatch.setattr(v, "_replace", replace_then_touch)
     with pytest.raises(OSError, match="changed while it was being fixed"):
         v.fix_file(p, backup=True)
     assert p.read_text() == "newer: 1\n"
@@ -1303,41 +981,8 @@ def test_backup_is_written_beside_the_symlink(tmp_path):
     assert sorted(x.name for x in real.iterdir()) == ["t.yaml"]
 
 
-def test_source_acl_enotsup_on_getxattr_aborts(tmp_path, monkeypatch):
-    import errno
-
-    import yaml_validator.validator as v
-
-    def unsupported(fd, name):
-        raise OSError(errno.ENOTSUP, "Operation not supported")
-
-    monkeypatch.setattr(
-        v.os, "listxattr", lambda fd: ["system.posix_acl_access"], raising=False
-    )
-    monkeypatch.setattr(v.os, "getxattr", unsupported, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="cannot read extended attributes"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
 
 
-def test_temp_listxattr_enotsup_aborts_when_source_has_acl(tmp_path, monkeypatch):
-    import errno
-
-    import yaml_validator.validator as v
-
-    def listxattr(fd):
-        raise OSError(errno.ENOTSUP, "Operation not supported")
-
-    monkeypatch.setattr(
-        v, "_read_xattrs", lambda fd: {"system.posix_acl_access": b"acl"}
-    )
-    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="not supported"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
 def test_backup_aliasing_the_target_is_refused(tmp_path):
@@ -1425,12 +1070,3 @@ def test_unrelated_schema_is_not_a_backup_collision(tmp_path):
     assert (tmp_path / "a.yaml.bak").read_text() == "a: 1  \n"
 
 
-def test_ima_signed_file_is_refused(tmp_path, monkeypatch):
-    import yaml_validator.validator as v
-
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {"security.ima": b"sig"})
-    p = write(tmp_path, "a: 1  \n")
-    with pytest.raises(OSError, match="IMA signature"):
-        v.fix_file(p, backup=True)
-    assert p.read_text() == "a: 1  \n"
-    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]

@@ -12,10 +12,10 @@ import errno
 import os
 import stat
 import tempfile
-import warnings
 from dataclasses import dataclass, field
+from functools import reduce
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 from yaml.error import MarkedYAMLError
@@ -221,16 +221,19 @@ class FixResult:
     """Outcome of auto-fixing one file's content."""
 
     content: str
-    fixed: Dict[str, int] = field(default_factory=dict)  # rule -> issues fixed
-    skipped: Dict[str, str] = field(default_factory=dict)  # rule -> reason
+    fixed: Dict[str, int] = field(default_factory=dict)
+    skipped: Dict[str, str] = field(default_factory=dict)
 
     @property
     def total(self) -> int:
         return sum(self.fixed.values())
 
 
+LineFixer = Callable[[str], str]
+Check = Callable[[str, str, List[ValidationError]], None]
+
+
 def _fix_tab_line(line: str, tab_width: int) -> str:
-    """Replace tabs in the leading indentation of a tab-indented line."""
     if line.startswith("\t") and line.strip():
         indent = len(line) - len(line.lstrip(" \t"))
         return line[:indent].replace("\t", " " * tab_width) + line[indent:]
@@ -241,111 +244,72 @@ def _fix_trailing_line(line: str) -> str:
     return line.rstrip() if line.strip() else line
 
 
-def _load_all(content: str):
-    """Return ``(ok, documents)``; ``ok`` is False if *content* does not parse."""
+def _load_all(content: str) -> Tuple[bool, List[Any]]:
     try:
         return True, list(yaml.safe_load_all(content))
     except yaml.YAMLError:
-        return False, None
+        return False, []
 
 
-def _same_data(a, b) -> bool:
-    """Compare parsed YAML, coping with NaN and self-referential aliases."""
+def _same_data(a: List[Any], b: List[Any]) -> bool:
     try:
         if a == b:
             return True
-    except RecursionError:  # e.g. ``&a [*a]`` loads as a recursive list
+    except RecursionError:
         pass
     try:
-        return yaml.safe_dump_all(a) == yaml.safe_dump_all(b)
+        return bool(yaml.safe_dump_all(a) == yaml.safe_dump_all(b))
     except (yaml.YAMLError, RecursionError):
         return False
 
 
+def _parses_to(content: str, data: List[Any]) -> bool:
+    ok, parsed = _load_all(content)
+    return ok and _same_data(data, parsed)
+
+
 def _with_edits(lines: List[str], edits: Dict[int, str]) -> str:
-    out = list(lines)
-    for i, new in edits.items():
-        out[i] = new
-    return "\n".join(out)
+    return "\n".join(edits.get(i, line) for i, line in enumerate(lines))
 
 
 def _keep_data_preserving(
-    lines: List[str], edits: Dict[int, str], data
+    lines: List[str], edits: Dict[int, str], data: List[Any]
 ) -> Dict[int, str]:
-    """Return the subset of line *edits* that keeps the parsed data equal to *data*.
-
-    Edits are tried in bisected batches, so a document with k unsafe lines
-    costs O(k log n) parses rather than one parse per line.
-    """
+    """Bisect *edits* down to those that keep the parsed data equal to *data*."""
     accepted: Dict[int, str] = {}
 
     def visit(group: List[int]) -> None:
-        trial = dict(accepted)
-        trial.update({i: edits[i] for i in group})
-        ok, parsed = _load_all(_with_edits(lines, trial))
-        if ok and _same_data(data, parsed):
-            accepted.update({i: edits[i] for i in group})
+        trial = {**accepted, **{i: edits[i] for i in group}}
+        if _parses_to(_with_edits(lines, trial), data):
+            accepted.update(trial)
         elif len(group) > 1:
-            mid = len(group) // 2
-            visit(group[:mid])
-            visit(group[mid:])
+            visit(group[: len(group) // 2])
+            visit(group[len(group) // 2 :])
 
     visit(sorted(edits))
     return accepted
 
 
-def _revert_optional_edits(
-    tab_lines: List[str],
-    trimmed: Dict[int, str],
-    add_eof: bool,
-    data,
-) -> "tuple[List[str], bool]":
-    """Undo optional edits that changed the data of a repaired document.
-
-    Used when the original does not parse. *tab_lines* has the required
-    tab repairs applied; *trimmed* maps line index to its trailing-space
-    trim and *add_eof* says whether a final newline is added. Together they
-    parse to *data*. A trim or the EOF newline is reverted when the file
-    still parses without it, which means it wasn't needed to parse and it
-    changed a value (e.g. spaces inside a ``|`` block scalar). Each edit is
-    tracked separately, so a trim can be undone while the tab repair on the
-    same line stays. Bisected like :func:`_keep_data_preserving`.
-    """
-    units = sorted(trimmed) + (["eof"] if add_eof else [])
-    reverted: set = set()
-    state = {"data": data}
-
-    def render(extra) -> str:
-        undo = reverted | set(extra)
-        lines = [
-            ln if i in undo or i not in trimmed else trimmed[i]
-            for i, ln in enumerate(tab_lines)
-        ]
-        text = "\n".join(lines)
-        if add_eof and "eof" not in undo:
-            text += "\n"
-        return text
-
-    def visit(group) -> None:
-        ok, parsed = _load_all(render(group))
-        if not ok and len(group) == 1:
-            return  # needed to make the file parse
-        if ok and _same_data(state["data"], parsed):
-            return  # only cosmetic edits in this group: keep them
-        if len(group) == 1:
-            reverted.add(group[0])
-            state["data"] = parsed
-            return
-        mid = len(group) // 2
-        visit(group[:mid])
-        visit(group[mid:])
-
-    if units:
-        visit(units)
-    return render(()), add_eof and "eof" not in reverted
+def _preserving(content: str, data: List[Any], fixers: List[LineFixer]) -> str:
+    new = content
+    for fix_line in fixers:
+        lines = new.split("\n")
+        edits = {i: fix_line(ln) for i, ln in enumerate(lines) if fix_line(ln) != ln}
+        new = _with_edits(lines, _keep_data_preserving(lines, edits, data))
+    if new and not new.endswith("\n") and _parses_to(new + "\n", data):
+        new += "\n"
+    return new
 
 
-def _count(check, content: str) -> int:
+def _repair_tab_lines(content: str, fixers: List[LineFixer]) -> str:
+    lines = content.split("\n")
+    return "\n".join(
+        reduce(lambda acc, fix: fix(acc), fixers, ln) if ln.startswith("\t") else ln
+        for ln in lines
+    )
+
+
+def _count(check: Check, content: str) -> int:
     found: List[ValidationError] = []
     check(content, "", found)
     return len(found)
@@ -356,55 +320,28 @@ def fix_content(
 ) -> FixResult:
     """Fix tab indentation, trailing whitespace and a missing EOF newline.
 
-    Edits are line-based text edits, so comments, quoting, key order and
-    blank lines are left alone. A fix is kept only if it is provably safe:
-    when the content already parses, the parsed data must be unchanged
-    (e.g. trailing spaces inside a ``|`` block scalar are kept); when it
-    does not parse, the fixes must make it parse, and any edit that is not
-    needed for that and changes a value is undone. Running it twice gives
-    the same result as running it once.
+    A fix is kept only if the parsed data is unchanged. Content that does
+    not parse is fixed only if repairing its tab-indented lines makes it parse.
     """
-    line_fixers = [
-        ("no-tabs", _check_tab_indentation, lambda ln: _fix_tab_line(ln, tab_width))
-    ]
+    fix_tab: LineFixer = lambda line: _fix_tab_line(line, tab_width)  # noqa: E731
+    checks: List[Tuple[str, Check]] = [("no-tabs", _check_tab_indentation)]
+    fixers = [fix_tab]
     if fix_trailing_spaces:
-        line_fixers.append(
-            ("trailing-spaces", _check_trailing_spaces, _fix_trailing_line)
-        )
-    eof = ("end-of-file-newline", _check_missing_newline)
-    checks = [(rule, check) for rule, check, _ in line_fixers] + [eof]
-
+        checks.append(("trailing-spaces", _check_trailing_spaces))
+        fixers.append(_fix_trailing_line)
+    checks.append(("end-of-file-newline", _check_missing_newline))
     ok, data = _load_all(content)
     new = content
+    reason = "file is not valid YAML, so the fix cannot be verified"
+    for depth in [] if ok else range(1, len(fixers) + 1):
+        repaired = _repair_tab_lines(content, fixers[:depth])
+        ok, data = _load_all(repaired)
+        if ok:
+            new = repaired
+            break
     if ok:
+        new = _preserving(new, data, fixers)
         reason = "would change the parsed data"
-        for _, _, fix_line in line_fixers:
-            lines = new.split("\n")
-            edits = {i: fix_line(ln) for i, ln in enumerate(lines)}
-            edits = {i: v for i, v in edits.items() if v != lines[i]}
-            if edits:
-                new = _with_edits(lines, _keep_data_preserving(lines, edits, data))
-        if new and not new.endswith("\n"):
-            ok_eof, parsed = _load_all(new + "\n")
-            if ok_eof and _same_data(data, parsed):
-                new += "\n"
-    else:
-        reason = "file is not valid YAML, so the fix cannot be verified"
-        tab_fix = line_fixers[0][2]
-        tab_lines = [tab_fix(ln) for ln in content.split("\n")]
-        trimmed: Dict[int, str] = {}
-        if fix_trailing_spaces:
-            for i, ln in enumerate(tab_lines):
-                if _fix_trailing_line(ln) != ln:
-                    trimmed[i] = _fix_trailing_line(ln)
-        # content is non-empty here: "" parses as valid YAML (None).
-        add_eof = not content.endswith("\n")
-        candidate = "\n".join(trimmed.get(i, ln) for i, ln in enumerate(tab_lines))
-        ok_fixed, fixed_data = _load_all(candidate + ("\n" if add_eof else ""))
-        if ok_fixed:
-            new, _ = _revert_optional_edits(tab_lines, trimmed, add_eof, fixed_data)
-            reason = "would change the parsed data"
-
     result = FixResult(content=new)
     for rule, check in checks:
         before, after = _count(check, content), _count(check, new)
@@ -415,191 +352,108 @@ def fix_content(
     return result
 
 
-def _identity(st: os.stat_result) -> tuple:
+def _identity(st: os.stat_result) -> Tuple[int, int, int, int, int]:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
-
-
-def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
-    """Best effort: the source's extended attributes, which hold POSIX ACLs
-    (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
-
-    Returns None only where xattrs are unsupported (no ``os.listxattr``, or
-    ENOTSUP/EOPNOTSUPP); then none are copied, but inherited ACLs are still
-    stripped. Any other failure raises: a partial snapshot could leave an
-    inherited ACL granting access the source never gave. So does ENOTSUP
-    reading an ACL that ``listxattr`` just listed: the source clearly has
-    one, so it must not be silently dropped.
-    """
-    if not hasattr(os, "listxattr"):
-        return None
-    try:
-        names = os.listxattr(fd)
-    except OSError as exc:
-        if exc.errno in _XATTR_UNSUPPORTED:
-            return None
-        raise
-    attrs: Dict[str, bytes] = {}
-    for name in names:
-        try:
-            attrs[name] = os.getxattr(fd, name)
-        except OSError as exc:
-            if exc.errno in _XATTR_UNSUPPORTED and not name.startswith(_ACL_PREFIX):
-                return None
-            raise
-    return attrs
 
 
 _XATTR_UNSUPPORTED = {
     getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP") if hasattr(errno, name)
 }
-_ACL_PREFIX = "system.posix_acl_"
 
 
-def _warn(message: str) -> None:
-    warnings.warn(message, RuntimeWarning, stacklevel=3)
-
-
-def _apply_metadata(
-    fd: int,
-    path: str,
-    info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
-    mode: int,
-    copy_owner: bool,
-) -> None:
-    """Give the open temp file *fd* the source's metadata.
-
-    Order: group, then owner, then xattrs (while the file is still 0600),
-    then the mode. The source group must be on the temp before it is
-    renamed into place; owner restoration is best effort.
-    """
-    if copy_owner and hasattr(os, "fchown"):
-        # Group first: a caller in the file's group may set the group even
-        # though changing the owner needs extra privileges. Restoring the
-        # source mode onto a different group can take access from the
-        # intended group and give it to the temp's group, so a group change
-        # that does not stick aborts the fix. PermissionError is harmless
-        # only when the temp already has the source group (a no-op chown).
-        try:
-            os.fchown(fd, -1, info.st_gid)
-        except PermissionError as exc:
-            if os.fstat(fd).st_gid != info.st_gid:
-                raise OSError(
-                    errno.EPERM,
-                    "could not preserve the file's group; not fixed",
-                    path,
-                ) from exc
-        try:
-            os.fchown(fd, info.st_uid, -1)
-        except PermissionError:
-            pass
-    if attrs is not None or hasattr(os, "listxattr"):
-        try:
-            inherited = os.listxattr(fd)
-        except OSError as exc:
-            # ENOTSUP is only "nothing inherited" if the source had no ACL;
-            # otherwise the source's ACL could not be checked against it.
-            if exc.errno not in _XATTR_UNSUPPORTED or any(
-                name.startswith(_ACL_PREFIX) for name in attrs or {}
-            ):
-                raise
-            inherited = []  # no xattrs here, so nothing can be inherited
-        # Inherited ACLs (e.g. from a default ACL) are always stripped first;
-        # the source's own ACL, if any, is set afresh below.
-        for name in inherited:
-            if not name.startswith(_ACL_PREFIX):
-                # Unknown source xattrs (None): keep the rest.
-                if attrs is None or name in attrs:
-                    continue
-            try:
-                os.removexattr(fd, name)
-            except OSError as exc:
-                if name.startswith(_ACL_PREFIX):
-                    raise  # an inherited ACL left in place could widen access
-                _warn(f"--fix: could not remove inherited xattr {name}: {exc}")
-        for name, value in (attrs or {}).items():
-            try:
-                os.setxattr(fd, name, value)
-            except OSError as exc:
-                if name.startswith(_ACL_PREFIX):
-                    raise  # never install the file without its intended ACL
-                _warn(f"--fix: could not copy xattr {name}: {exc}")
-    if hasattr(os, "fchmod"):
-        os.fchmod(fd, mode)
-    else:  # Windows
-        os.chmod(path, mode)
-
-
-def _write_new(
-    fd: int,
-    path: str,
-    data: bytes,
-    info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
-    mode: int,
-    copy_owner: bool,
-) -> None:
+def _refuse_xattrs(fd: int, target: Path) -> None:
+    if not hasattr(os, "listxattr"):
+        return
     try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view) :]
-        _apply_metadata(fd, path, info, attrs, mode, copy_owner)
-    finally:
-        os.close(fd)
+        names = os.listxattr(fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_UNSUPPORTED:
+            return
+        raise OSError(
+            f"{target}: cannot read extended attributes ({exc}); not fixed"
+        ) from exc
+    for name in names:
+        if name.startswith("system.posix_acl_"):
+            raise OSError(f"{target} has a POSIX ACL ({name}); not fixed")
+        if name.startswith("security."):
+            raise OSError(f"{target} has a security xattr ({name}); not fixed")
+        try:
+            os.getxattr(fd, name)
+        except OSError as exc:
+            raise OSError(
+                f"{target}: cannot read xattr {name} ({exc}); not fixed"
+            ) from exc
 
 
-def _atomic_write(
-    dest: Path,
-    data: bytes,
-    info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
-    mode: int,
-    copy_owner: bool = True,
-    before_replace=None,
-) -> None:
-    """Write *data* to a temp file beside *dest*, then rename it over *dest*.
+def _named(exc: OSError, dest: Path) -> OSError:
+    if exc.errno is None:
+        return exc
+    return type(exc)(exc.errno, exc.strerror, str(dest))
 
-    ``mkstemp`` creates the temp file with ``O_EXCL`` at 0600; metadata is
-    applied through its descriptor before the rename. OS errors name *dest*,
-    not the temp file; errors from *before_replace* (e.g. writing the .bak)
-    keep their own filename.
-    """
-    temporary = None
-    in_callback = False
+
+def _discard(path: str) -> None:
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def _write_temp(
+    dest: Path, data: bytes, info: os.stat_result, mode: int, keep_group: bool
+) -> str:
     try:
         fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
-        _write_new(fd, temporary, data, info, attrs, mode, copy_owner)
-        if before_replace is not None:
-            in_callback = True
-            before_replace()
-            in_callback = False
+    except OSError as exc:
+        raise _named(exc, dest) from exc
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            if keep_group:
+                _keep_group(fd, info, dest)
+            _refuse_inherited_acl(fd, dest)
+        finally:
+            os.close(fd)
+        os.chmod(temporary, mode)
+    except OSError as exc:
+        _discard(temporary)
+        raise _named(exc, dest) from exc
+    return temporary
+
+
+def _keep_group(fd: int, info: os.stat_result, dest: Path) -> None:
+    if not hasattr(os, "fchown"):
+        return
+    try:
+        os.fchown(fd, -1, info.st_gid)
+    except PermissionError as exc:
+        if os.fstat(fd).st_gid != info.st_gid:
+            raise OSError(
+                errno.EPERM, "could not preserve the file's group; not fixed", str(dest)
+            ) from exc
+
+
+def _refuse_inherited_acl(fd: int, dest: Path) -> None:
+    if not hasattr(os, "listxattr"):
+        return
+    try:
+        names = os.listxattr(fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_UNSUPPORTED:
+            return
+        raise
+    if any(name.startswith("system.posix_acl_") for name in names):
+        raise OSError(f"{dest}: the directory's default ACL would apply; not fixed")
+
+
+def _replace(temporary: str, dest: Path) -> None:
+    try:
         os.replace(temporary, dest)
     except OSError as exc:
-        if in_callback:
-            raise
-        if exc.errno is not None and exc.filename != str(dest):
-            raise type(exc)(exc.errno, exc.strerror, str(dest)) from exc
-        raise
-    finally:
-        if temporary is not None:
-            _remove_quietly(temporary)
-
-
-def _remove_quietly(path: str) -> None:
-    """Delete a leftover temp file without masking the error in flight.
-
-    On Windows a read-only file cannot be deleted, so clear that bit first.
-    """
-    try:
-        os.unlink(path)
-    except FileNotFoundError:
-        pass
-    except OSError:
-        try:
-            os.chmod(path, stat.S_IWRITE)
-            os.unlink(path)
-        except OSError:
-            pass
+        _discard(temporary)
+        raise _named(exc, dest) from exc
 
 
 def fix_file(
@@ -608,92 +462,47 @@ def fix_file(
     fix_trailing_spaces: bool = True,
     backup: bool = False,
 ) -> FixResult:
-    """Apply :func:`fix_content` to *path* in place.
+    """Apply :func:`fix_content` to *path* in place, via an atomic rename.
 
-    The file is only rewritten if something was fixed. CRLF line endings
-    are kept. With ``backup=True`` the original bytes are first saved to
-    ``<name>.bak`` (e.g. ``config.yaml.bak``), always at mode 0600.
-
-    The fixed file is written to a temporary file and renamed over the
-    original, keeping its mode and group and, best effort, its owner and
-    extended attributes (ACLs, SELinux labels). If the group cannot be
-    restored, the fix is aborted and the original is left unchanged. On
-    filesystems without xattr support, xattrs are simply not copied.
-    Renaming breaks hard links: other names for the file keep the old
-    content.
-
-    With ``backup=True``, the .bak is written just before the final rename.
-    If the target is then found to have changed (a concurrent writer), the
-    fix is aborted but the previous .bak has already been replaced by the
-    snapshot that was read, which no longer matches the target. Likewise,
-    if the final rename fails, e.g. with EPERM in a sticky directory (such
-    as /tmp) where the target belongs to another user, the new .bak is left
-    behind even though the target was not fixed.
-
-    Files with an IMA signature (``security.ima``) are refused: the
-    signature covers the old bytes and cannot be regenerated here.
+    Files with POSIX ACLs, security xattrs or unreadable xattrs are refused.
+    With ``backup=True`` the original is saved to ``<name>.bak`` at 0600.
     """
     path = Path(path)
-    # Resolve once, then read and replace that same target, so a symlink
-    # retargeted mid-run cannot redirect the write.
     target = Path(os.path.realpath(path))
-    # The .bak goes beside the given path, with its directory resolved now.
     bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
     if backup and os.path.realpath(bak) == str(target):
-        # e.g. f.yaml -> f.yaml.bak: the backup would overwrite the source.
         raise OSError(f"{bak} is the file being fixed; not fixed")
     with open(target, "rb") as source:
         before = os.fstat(source.fileno())
         raw = source.read()
         info = os.fstat(source.fileno())
         if _identity(before) != _identity(info):
-            # Written to while we read it: raw may mix old and new bytes.
             raise OSError(f"{target} changed while it was being read; not fixed")
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
         result = fix_content(
-            # Universal newlines, as read_text() would give.
-            raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
-            tab_width=tab_width,
-            fix_trailing_spaces=fix_trailing_spaces,
+            text, tab_width=tab_width, fix_trailing_spaces=fix_trailing_spaces
         )
         if not result.fixed:
-            return result  # nothing to write, so no xattr snapshot needed
-        try:
-            attrs = _read_xattrs(source.fileno())
-        except OSError as exc:
-            raise OSError(
-                exc.errno,
-                f"cannot read extended attributes: {exc.strerror}",
-                str(target),
-            ) from exc
-        if attrs and "security.ima" in attrs:
-            raise OSError(
-                f"{target} has an IMA signature that would not match the "
-                "fixed content; not fixed"
-            )
+            return result
+        _refuse_xattrs(source.fileno(), target)
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
-
-    def check() -> None:
-        # Same file, and not rewritten in place since it was read.
-        if _identity(os.stat(target)) != _identity(info):
-            raise OSError(f"{target} changed while it was being fixed; not overwritten")
-
-    def unchanged() -> None:
-        check()
+    temporary = _write_temp(target, data, info, stat.S_IMODE(info.st_mode), True)
+    try:
+        _check_unchanged(target, info)
         if backup:
-            # Only once the source is known unchanged. Built in a temp file
-            # and swapped in, so a failed write keeps the previous backup;
-            # os.replace replaces a planted .bak symlink, not its target.
-            # The backup is private: 0600, owned by the caller, and with no
-            # ACLs or other xattrs ({}: strip any it inherits).
-            bak_attrs = None if attrs is None else {}
-            _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
-            check()  # again: the target may have changed during the backup
-
-    _atomic_write(
-        target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged
-    )
+            _replace(_write_temp(bak, raw, info, 0o600, False), bak)
+            _check_unchanged(target, info)
+    except OSError:
+        _discard(temporary)
+        raise
+    _replace(temporary, target)
     return result
+
+
+def _check_unchanged(target: Path, info: os.stat_result) -> None:
+    if _identity(os.stat(target)) != _identity(info):
+        raise OSError(f"{target} changed while it was being fixed; not overwritten")
 
 
 # ── High-level API ──────────────────────────────────────────────────────────
@@ -790,9 +599,7 @@ def _validate_schema(
 
     if not schema_path.exists():
         sub.errors.append(
-            ValidationError(
-                message=f"Schema file not found: {schema_path}", rule="io"
-            )
+            ValidationError(message=f"Schema file not found: {schema_path}", rule="io")
         )
         return sub
 
