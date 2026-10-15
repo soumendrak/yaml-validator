@@ -191,3 +191,31 @@ def test_fix_many_lines_with_one_unsafe_is_fast():
     assert time.perf_counter() - start < 10
     assert result.fixed == {"trailing-spaces": 2000}
     assert "  keep   \n" in result.content
+
+
+def test_fix_combined_keeps_unterminated_block_scalar_eof():
+    import yaml
+
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("a:\n\tb: 1\nmsg: |\n  x")
+    assert result.content == "a:\n  b: 1\nmsg: |\n  x"
+    assert yaml.safe_load(result.content)["msg"] == "x"
+    assert "end-of-file-newline" in result.skipped
+
+
+def test_fix_combined_same_line_tab_and_significant_spaces():
+    import yaml
+
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("msg: |\n\tx   \n  y\n")
+    assert yaml.safe_load(result.content)["msg"] == "x   \ny\n"
+    assert "\t" not in result.content
+
+
+def test_fix_quiet_hides_skipped_warnings(tmp_path):
+    p = write(tmp_path, "msg: |\n  keep me   \n")
+    r = run("check", "--fix", "--quiet", p.name, cwd=tmp_path)
+    assert "Skipped" not in r.stdout
+    assert r.returncode == 0

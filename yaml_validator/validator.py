@@ -292,39 +292,55 @@ def _keep_data_preserving(
     return accepted
 
 
-def _revert_data_changing(original: List[str], fixed: List[str], data) -> List[str]:
-    """Undo edits in *fixed* (which parses to *data*) that changed the data.
+def _revert_optional_edits(
+    tab_lines: List[str],
+    trimmed: Dict[int, str],
+    add_eof: bool,
+    data,
+) -> "tuple[List[str], bool]":
+    """Undo optional edits that changed the data of a repaired document.
 
-    Used when the original does not parse, so the fixes are needed together.
-    An edit is reverted when the file still parses without it, which means
-    the edit was not needed to make the file parse and it altered a value
-    (e.g. trailing spaces inside a ``|`` block scalar). Bisected like
-    :func:`_keep_data_preserving`.
+    Used when the original does not parse. *tab_lines* has the required
+    tab repairs applied; *trimmed* maps line index to its trailing-space
+    trim and *add_eof* says whether a final newline is added. Together they
+    parse to *data*. A trim or the EOF newline is reverted when the file
+    still parses without it, which means it wasn't needed to parse and it
+    changed a value (e.g. spaces inside a ``|`` block scalar). Each edit is
+    tracked separately, so a trim can be undone while the tab repair on the
+    same line stays. Bisected like :func:`_keep_data_preserving`.
     """
-    result = list(fixed)
+    units = sorted(trimmed) + (["eof"] if add_eof else [])
+    reverted: set = set()
     state = {"data": data}
 
-    def visit(group: List[int]) -> None:
-        trial = list(result)
-        for i in group:
-            trial[i] = original[i]
-        ok, parsed = _load_all("\n".join(trial))
+    def render(extra) -> str:
+        undo = reverted | set(extra)
+        lines = [
+            ln if i in undo or i not in trimmed else trimmed[i]
+            for i, ln in enumerate(tab_lines)
+        ]
+        text = "\n".join(lines)
+        if add_eof and "eof" not in undo:
+            text += "\n"
+        return text
+
+    def visit(group) -> None:
+        ok, parsed = _load_all(render(group))
         if not ok and len(group) == 1:
             return  # needed to make the file parse
         if ok and _same_data(state["data"], parsed):
             return  # only cosmetic edits in this group: keep them
         if len(group) == 1:
-            result[group[0]] = original[group[0]]
+            reverted.add(group[0])
             state["data"] = parsed
             return
         mid = len(group) // 2
         visit(group[:mid])
         visit(group[mid:])
 
-    changed = [i for i, (a, b) in enumerate(zip(original, fixed)) if a != b]
-    if changed:
-        visit(changed)
-    return result
+    if units:
+        visit(units)
+    return render(()), add_eof and "eof" not in reverted
 
 
 def _count(check, content: str) -> int:
@@ -372,14 +388,18 @@ def fix_content(
                 new += "\n"
     else:
         reason = "file is not valid YAML, so the fix cannot be verified"
-        base = content + "\n" if content and not content.endswith("\n") else content
-        original = base.split("\n")
-        fixed = list(original)
-        for _, _, fix_line in line_fixers:
-            fixed = [fix_line(ln) for ln in fixed]
-        ok_fixed, fixed_data = _load_all("\n".join(fixed))
+        tab_fix = line_fixers[0][2]
+        tab_lines = [tab_fix(ln) for ln in content.split("\n")]
+        trimmed: Dict[int, str] = {}
+        if fix_trailing_spaces:
+            for i, ln in enumerate(tab_lines):
+                if _fix_trailing_line(ln) != ln:
+                    trimmed[i] = _fix_trailing_line(ln)
+        add_eof = bool(content) and not content.endswith("\n")
+        candidate = "\n".join(trimmed.get(i, ln) for i, ln in enumerate(tab_lines))
+        ok_fixed, fixed_data = _load_all(candidate + ("\n" if add_eof else ""))
         if ok_fixed:
-            new = "\n".join(_revert_data_changing(original, fixed, fixed_data))
+            new, _ = _revert_optional_edits(tab_lines, trimmed, add_eof, fixed_data)
             reason = "would change the parsed data"
 
     result = FixResult(content=new)

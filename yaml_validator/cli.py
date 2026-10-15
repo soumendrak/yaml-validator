@@ -219,6 +219,8 @@ def _print_fixes(path: str, fixes, quiet: bool = False) -> None:
         detail = ", ".join(f"{n} {rule}" for rule, n in fixes.fixed.items() if n)
         print(f"Fixed {fixes.total} issue(s) in {path} ({detail})")
     for rule, reason in fixes.skipped.items():
+        if quiet and rule != "no-tabs":  # --quiet: errors only, no warnings
+            continue
         print(f"Skipped {rule} fix in {path}: {reason}")
 
 
