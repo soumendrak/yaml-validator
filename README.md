@@ -22,6 +22,7 @@
 
 - **Syntax validation** — catches malformed YAML with precise line/column reporting
 - **Style checks** — trailing whitespace, tab indentation, line length, missing EOF newlines
+- **Auto-fix** — `--fix` repairs tab indentation, trailing whitespace and missing EOF newlines in place, without touching comments or layout
 - **Schema validation** — validate YAML structure against a JSON Schema (or YAML schema) file
 - **Multi-document support** — handles YAML files with `---` separators
 - **Machine-readable output** — `--json` flag for CI/CD integration
@@ -65,14 +66,21 @@ yaml-validator check config.yaml --json
 
 # Lint (alias for check)
 yaml-validator lint config.yaml
+
+# Auto-fix style issues in place, then validate
+yaml-validator check config.yaml --fix
 ```
+
+### Auto-fix (`--fix`)
+
+`--fix` rewrites tab indentation (`--tab-width`, default 2), trailing whitespace and a missing final newline, then validates. A fix is kept only if the parsed data is unchanged. The file is replaced atomically. Only its mode, group and owner are preserved; any other metadata is not, so files with extended attributes (`user.*`, `security.*`, POSIX ACLs) are refused, as are files with more than one hard link. Fixing a file owned by another user requires running as that owner or as root. `--backup` saves the original as `<file>.bak` (mode 0600). A tab-indented line directly after a block scalar (`|` or `>`) becomes part of the scalar once its tab is replaced, since YAML cannot tell the two apart. With `--json`, the output gains `fixed` and `fix_skipped` keys.
 
 ### Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0    | All files valid |
-| 1    | One or more files invalid or errors encountered |
+| 1    | One or more files invalid or errors encountered (with `--fix`: a file is still invalid after fixing) |
 
 ## Examples
 
@@ -97,15 +105,17 @@ $ yaml-validator check config.yaml
 # bad.yaml
 server:
   host: localhost
-	port: 8080	# ← tab used for indentation
+	port: 8080
 ```
 
 ```bash
 $ yaml-validator check bad.yaml
+[ERROR] line 3:1: found character '\t' that cannot start any token
 [ERROR] line 3: Tab character used for indentation (YAML requires spaces)
 
 ✗ bad.yaml
    1 error(s)
+   1 warning(s)
 ```
 
 ## Schema Validation
@@ -159,7 +169,8 @@ yaml-validator/
 ├── yaml_validator/
 │   ├── __init__.py     # Package metadata
 │   ├── cli.py          # CLI entry point (argparse)
-│   └── validator.py    # Core validation engine
+│   └── validator.py    # Core validation engine and --fix logic
+├── tests/              # pytest suite
 ├── pyproject.toml      # Project metadata & build config
 ├── requirements.txt    # Dependency pins
 ├── LICENSE             # MIT License

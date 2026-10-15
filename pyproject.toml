@@ -14,6 +14,7 @@ dependencies = [
 
 [project.optional-dependencies]
 schema = ["jsonschema>=4.20,<5.0"]
+dev = ["pytest", "mypy", "ruff", "types-PyYAML", "types-jsonschema"]
 
 [project.urls]
 Homepage = "https://github.com/soumendrak/yaml-validator"

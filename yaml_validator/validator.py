@@ -5,17 +5,22 @@ Provides:
   - parse_yaml()     — safe YAML load with detailed error reporting
   - validate_file()  — syntax + optional schema validation for a YAML file
   - ValidationResult — typed result with errors, warnings, metadata
+  - fix_content() / fix_file() — safe auto-fix for tabs, trailing spaces, EOF newline
 """
 
+import errno
 import os
-import re
+import stat
+import tempfile
+from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Any, Union
 
 import yaml
 from yaml.error import MarkedYAMLError
-
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
@@ -25,8 +30,8 @@ class ValidationError:
     """A single validation finding."""
 
     message: str
-    line: Optional[int] = None
-    column: Optional[int] = None
+    line: int | None = None
+    column: int | None = None
     severity: str = "error"  # "error" | "warning" | "info"
     rule: str = ""
 
@@ -47,10 +52,10 @@ class ValidationResult:
 
     path: str
     is_valid: bool
-    errors: List[ValidationError] = field(default_factory=list)
-    warnings: List[ValidationError] = field(default_factory=list)
+    errors: list[ValidationError] = field(default_factory=list)
+    warnings: list[ValidationError] = field(default_factory=list)
     document_count: int = 0
-    data: Optional[object] = None
+    data: object | None = None
 
     @property
     def summary(self) -> str:
@@ -71,7 +76,7 @@ def parse_yaml(
     content: str,
     source: str = "<string>",
     multi_document: bool = False,
-) -> Union[object, List[object], "ValidationResult"]:
+) -> Union[object, list[object], "ValidationResult"]:
     """Parse YAML content and return data or a ValidationResult on failure.
 
     Args:
@@ -86,9 +91,10 @@ def parse_yaml(
     """
     try:
         if multi_document:
-            docs = list(yaml.safe_load_all(content))
+            docs: list[object] = list(yaml.safe_load_all(content))
             return docs
-        return yaml.safe_load(content)
+        loaded: object = yaml.safe_load(content)
+        return loaded
     except MarkedYAMLError as e:
         line = None
         column = None
@@ -108,7 +114,7 @@ def parse_yaml(
                 )
             ],
         )
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, ValueError, TypeError) as e:
         return ValidationResult(
             path=source,
             is_valid=False,
@@ -125,7 +131,7 @@ def parse_yaml(
 
 
 def _check_trailing_spaces(
-    content: str, source: str, errors: List[ValidationError]
+    content: str, source: str, errors: list[ValidationError]
 ) -> None:
     """Flag lines with trailing whitespace."""
     for i, line in enumerate(content.split("\n"), start=1):
@@ -141,7 +147,7 @@ def _check_trailing_spaces(
 
 
 def _check_line_length(
-    content: str, source: str, errors: List[ValidationError], max_len: int = 200
+    content: str, source: str, errors: list[ValidationError], max_len: int = 200
 ) -> None:
     """Flag lines exceeding *max_len* characters."""
     for i, line in enumerate(content.split("\n"), start=1):
@@ -157,7 +163,7 @@ def _check_line_length(
 
 
 def _check_tab_indentation(
-    content: str, source: str, errors: List[ValidationError]
+    content: str, source: str, errors: list[ValidationError]
 ) -> None:
     """Flag lines using tab indentation (invalid in YAML indentation)."""
     for i, line in enumerate(content.split("\n"), start=1):
@@ -173,7 +179,7 @@ def _check_tab_indentation(
 
 
 def _check_missing_newline(
-    content: str, source: str, errors: List[ValidationError]
+    content: str, source: str, errors: list[ValidationError]
 ) -> None:
     """Warn if file doesn't end with a newline."""
     if content and not content.endswith("\n"):
@@ -188,7 +194,7 @@ def _check_missing_newline(
 
 
 def _detect_tab_vs_space(
-    data: object, errors: List[ValidationError], path: str = "$"
+    data: object, errors: list[ValidationError], path: str = "$"
 ) -> None:
     """Recursively check for mixed indentation in nested structures
     (spot-check data values for unexpected tabs)."""
@@ -209,12 +215,310 @@ def _detect_tab_vs_space(
             _detect_tab_vs_space(item, errors, f"{path}[{i}]")
 
 
+@dataclass
+class FixResult:
+    """Outcome of auto-fixing one file's content."""
+
+    content: str
+    fixed: dict[str, int] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+
+    @property
+    def total(self) -> int:
+        return sum(self.fixed.values())
+
+
+LineFixer = Callable[[str], str]
+Check = Callable[[str, str, list[ValidationError]], None]
+
+
+def _fix_tab_line(line: str, tab_width: int) -> str:
+    if line.startswith("\t") and line.strip():
+        indent = len(line) - len(line.lstrip(" \t"))
+        return line[:indent].replace("\t", " " * tab_width) + line[indent:]
+    return line
+
+
+def _fix_trailing_line(line: str) -> str:
+    return line.rstrip() if line.strip() else line
+
+
+def _load_all(content: str) -> tuple[bool, list[Any]]:
+    try:
+        return True, list(yaml.safe_load_all(content))
+    except (yaml.YAMLError, ValueError, TypeError):
+        return False, []
+
+
+def _same_data(a: list[Any], b: list[Any]) -> bool:
+    with suppress(RecursionError):
+        if a == b:
+            return True
+    try:
+        return bool(yaml.safe_dump_all(a) == yaml.safe_dump_all(b))
+    except (yaml.YAMLError, RecursionError):
+        return False
+
+
+def _parses_to(content: str, data: list[Any]) -> bool:
+    ok, parsed = _load_all(content)
+    return ok and _same_data(data, parsed)
+
+
+def _with_edits(lines: list[str], edits: dict[int, str]) -> str:
+    return "\n".join(edits.get(i, line) for i, line in enumerate(lines))
+
+
+def _keep_data_preserving(
+    lines: list[str], edits: dict[int, str], data: list[Any]
+) -> dict[int, str]:
+    inside = _block_scalar_lines("\n".join(lines))
+    kept = {i: line for i, line in edits.items() if i not in inside}
+    return kept if _parses_to(_with_edits(lines, kept), data) else {}
+
+
+def _preserving(content: str, data: list[Any], fixers: list[LineFixer]) -> str:
+    new = content
+    for fix_line in fixers:
+        lines = new.split("\n")
+        edits = {i: fix_line(ln) for i, ln in enumerate(lines) if fix_line(ln) != ln}
+        new = _with_edits(lines, _keep_data_preserving(lines, edits, data))
+    if new and not new.endswith("\n") and _parses_to(new + "\n", data):
+        new += "\n"
+    return new
+
+
+def _strip_breaking_tab(line: str) -> str:
+    body = line.rstrip(" \t")
+    trail = line[len(body) :]
+    if "\t" not in trail or not body:
+        return line
+    return body + trail.replace("\t", "")
+
+
+def _block_scalar_lines(text: str) -> set[int]:
+    inside: set[int] = set()
+    for event in yaml.parse(text, Loader=yaml.SafeLoader):
+        start, end = event.start_mark, event.end_mark
+        block = isinstance(event, yaml.ScalarEvent) and event.style in ("|", ">")
+        if block and start and end:
+            inside.update(range(start.line + 1, end.line + bool(end.column)))
+    return inside
+
+
+def _baseline(
+    content: str, fix_tab: LineFixer, strip_tabs: bool
+) -> tuple[bool, str, list[Any]]:
+    lines = [fix_tab(line) for line in content.split("\n")]
+    ok, data = _load_all("\n".join(lines))
+    if ok or not strip_tabs:
+        return ok, "\n".join(lines) if ok else content, data
+    edits = {i: _strip_breaking_tab(ln) for i, ln in enumerate(lines)}
+    edits = {i: ln for i, ln in edits.items() if ln != lines[i]}
+    if edits and _load_all(_with_edits(lines, edits))[0]:
+        inside = _block_scalar_lines(_with_edits(lines, edits))
+        text = _with_edits(lines, {i: edits[i] for i in edits if i not in inside})
+        ok, data = _load_all(text)
+        if ok:
+            return True, text, data
+    return False, content, []
+
+
+def _count(check: Check, content: str) -> int:
+    found: list[ValidationError] = []
+    check(content, "", found)
+    return len(found)
+
+
+def fix_content(
+    content: str, tab_width: int = 2, fix_trailing_spaces: bool = True
+) -> FixResult:
+    """Fix tabs, trailing whitespace and a missing EOF newline, keeping only
+    fixes that leave the parsed data unchanged. Invalid YAML is fixed only
+    when replacing tabs (and dropping syntax-breaking trailing tabs) makes
+    it parse."""
+    if tab_width < 1:
+        raise ValueError("tab_width must be at least 1")
+    fix_tab: LineFixer = partial(_fix_tab_line, tab_width=tab_width)
+    checks: list[tuple[str, Check]] = [("no-tabs", _check_tab_indentation)]
+    fixers: list[LineFixer] = [fix_tab]
+    if fix_trailing_spaces:
+        checks.append(("trailing-spaces", _check_trailing_spaces))
+        fixers.append(_fix_trailing_line)
+    checks.append(("end-of-file-newline", _check_missing_newline))
+    ok, data = _load_all(content)
+    new = content
+    reason = "file is not valid YAML, so the fix cannot be verified"
+    if not ok:
+        ok, new, data = _baseline(content, fix_tab, fix_trailing_spaces)
+    if ok:
+        new = _preserving(new, data, fixers)
+        reason = "would change the parsed data"
+    result = FixResult(content=new)
+    for rule, check in checks:
+        before, after = _count(check, content), _count(check, new)
+        if before > after:
+            result.fixed[rule] = before - after
+        if after:
+            result.skipped[rule] = f"{after} not fixed: {reason}"
+    return result
+
+
+def _identity(st: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+_XATTR_UNSUPPORTED = {errno.ENOTSUP, errno.EOPNOTSUPP}
+
+
+def _xattr_names(fd: int) -> list[str]:
+    if not hasattr(os, "listxattr"):
+        return []
+    try:
+        return os.listxattr(fd)
+    except OSError as exc:
+        if exc.errno in _XATTR_UNSUPPORTED:
+            return []
+        raise
+
+
+def _refuse_xattrs(fd: int, target: Path) -> None:
+    try:
+        names = _xattr_names(fd)
+    except OSError as exc:
+        raise OSError(f"{target}: cannot read extended attributes ({exc})") from exc
+    for name in names:
+        try:
+            os.getxattr(fd, name)
+        except OSError as exc:
+            if exc.errno == errno.ENODATA:
+                continue
+            raise OSError(f"{target}: cannot read xattr {name} ({exc})") from exc
+        kept = "--fix keeps only mode, group and owner"
+        raise OSError(f"{target} has extended attribute {name} ({kept}); not fixed")
+
+
+def _reject_inherited(fd: int, dest: Path) -> None:
+    for name in _xattr_names(fd):
+        if name.startswith("system.posix_acl_"):
+            raise OSError(f"{dest}: the directory's default ACL would apply")
+        if name.startswith("security."):
+            raise OSError(f"{dest}: inherited security xattr {name}; not fixed")
+
+
+def _named(exc: OSError, dest: Path) -> OSError:
+    return exc if exc.errno is None else type(exc)(exc.errno, exc.strerror, str(dest))
+
+
+def _discard(path: str) -> None:
+    with suppress(OSError):
+        os.chmod(path, stat.S_IWRITE)
+        os.unlink(path)
+
+
+def _write_temp(
+    dest: Path, data: bytes, info: os.stat_result, mode: int, keep_owner: bool
+) -> str:
+    try:
+        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=".yaml-validator.")
+    except OSError as exc:
+        raise _named(exc, dest) from exc
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            if keep_owner:
+                _keep_owner(fd, info, dest)
+            _reject_inherited(fd, dest)
+        finally:
+            os.close(fd)
+        os.chmod(temporary, mode)
+    except OSError as exc:
+        _discard(temporary)
+        raise _named(exc, dest) from exc
+    return temporary
+
+
+def _keep_owner(fd: int, info: os.stat_result, dest: Path) -> None:
+    if not hasattr(os, "fchown"):
+        return
+    try:
+        os.fchown(fd, info.st_uid, info.st_gid)
+    except PermissionError as exc:
+        current = os.fstat(fd)
+        if current.st_uid != info.st_uid:
+            what = "owner; run --fix as the file's owner (or as root)"
+        elif current.st_gid != info.st_gid:
+            what = "group"
+        else:
+            return
+        message = f"could not preserve the file's {what}; not fixed"
+        raise OSError(errno.EPERM, message, str(dest)) from exc
+
+
+def _replace(temporary: str, dest: Path) -> None:
+    try:
+        os.replace(temporary, dest)
+    except OSError as exc:
+        _discard(temporary)
+        raise _named(exc, dest) from exc
+
+
+def fix_file(
+    path: str | Path,
+    tab_width: int = 2,
+    fix_trailing_spaces: bool = True,
+    backup: bool = False,
+) -> FixResult:
+    """Apply :func:`fix_content` to *path* in place via an atomic rename, keeping
+    mode, group and owner; files with extended attributes are refused."""
+    path = Path(path)
+    target = Path(os.path.realpath(path))
+    bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
+    if backup and os.path.realpath(bak) == str(target):
+        raise OSError(f"{bak} is the file being fixed; not fixed")
+    if not stat.S_ISREG(os.stat(target).st_mode):
+        raise OSError(f"{target} is not a regular file; not fixed")
+    with open(target, "rb") as source:
+        before = os.fstat(source.fileno())
+        raw = source.read()
+        info = os.fstat(source.fileno())
+        if _identity(before) != _identity(info):
+            raise OSError(f"{target} changed while it was being read; not fixed")
+        text = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        result = fix_content(text, tab_width, fix_trailing_spaces)
+        if not result.fixed:
+            return result
+        _refuse_xattrs(source.fileno(), target)
+    if info.st_nlink > 1:
+        raise OSError(f"{target} has {info.st_nlink} hard links; not fixed")
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    data = result.content.replace("\n", newline).encode("utf-8")
+    temporary = _write_temp(target, data, info, stat.S_IMODE(info.st_mode), True)
+    try:
+        _check_unchanged(target, info, raw)
+        if backup:
+            _replace(_write_temp(bak, raw, info, 0o600, False), bak)
+            _check_unchanged(target, info, raw)
+    except OSError:
+        _discard(temporary)
+        raise
+    _replace(temporary, target)
+    return result
+
+
+def _check_unchanged(target: Path, info: os.stat_result, raw: bytes) -> None:
+    if _identity(os.stat(target)) != _identity(info) or target.read_bytes() != raw:
+        raise OSError(f"{target} changed while it was being fixed; not overwritten")
+
+
 # ── High-level API ──────────────────────────────────────────────────────────
 
 
 def validate_file(
-    path: Union[str, Path],
-    schema_path: Optional[Union[str, Path]] = None,
+    path: str | Path,
+    schema_path: str | Path | None = None,
     multi_document: bool = False,
     check_line_length: bool = True,
     check_trailing_spaces: bool = True,
@@ -244,7 +548,7 @@ def validate_file(
     content = path.read_text(encoding="utf-8")
     result = ValidationResult(path=str(path), is_valid=True, document_count=0)
 
-    warnings: List[ValidationError] = []
+    warnings: list[ValidationError] = []
 
     # ── Style checks (always run, before parse) ──
     if check_trailing_spaces:
@@ -265,7 +569,7 @@ def validate_file(
         return result
 
     # Parse succeeded
-    if multi_document:
+    if multi_document and isinstance(parsed, list):
         result.document_count = len(parsed)
         result.data = parsed
         for doc in parsed:
@@ -295,7 +599,7 @@ def validate_file(
 def _validate_schema(
     content: str,
     yaml_path: Path,
-    schema_path: Union[str, Path],
+    schema_path: str | Path,
 ) -> ValidationResult:
     """Validate parsed YAML data against a JSON Schema (or YAML schema)."""
     schema_path = Path(schema_path)
@@ -303,9 +607,7 @@ def _validate_schema(
 
     if not schema_path.exists():
         sub.errors.append(
-            ValidationError(
-                message=f"Schema file not found: {schema_path}", rule="io"
-            )
+            ValidationError(message=f"Schema file not found: {schema_path}", rule="io")
         )
         return sub
 
