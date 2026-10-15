@@ -11,23 +11,16 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional
 
 from . import __version__
 from .validator import FixResult, ValidationResult, fix_file, validate_file
 
 
 def _add_fix_args(p: argparse.ArgumentParser) -> None:
-    p.add_argument(
-        "--fix",
-        "-f",
-        action="store_true",
-        help="Fix tabs, trailing spaces and a missing EOF newline, then validate.",
-    )
+    fix_help = "Fix tabs, trailing spaces and a missing EOF newline, then validate."
+    p.add_argument("--fix", "-f", action="store_true", help=fix_help)
     p.add_argument("--backup", action="store_true", help="With --fix, keep <file>.bak.")
-    p.add_argument(
-        "--tab-width", type=int, default=2, help="Spaces per tab (default: 2)."
-    )
+    p.add_argument("--tab-width", type=int, default=2, help="Spaces per tab.")
 
 
 def main() -> int:
@@ -149,17 +142,13 @@ def main() -> int:
     exit_code = 0
 
     if args.fix and args.backup:
-        protected = {os.path.realpath(f) for f in args.files}
-        schema = getattr(args, "schema", None)
-        if schema:
-            protected.add(os.path.realpath(schema))
+        inputs = [*args.files, getattr(args, "schema", None) or args.files[0]]
+        protected = {os.path.realpath(f) for f in inputs}
         for f in args.files:
             bak = os.path.join(os.path.dirname(f) or ".", os.path.basename(f) + ".bak")
             if os.path.realpath(bak) in protected:
-                print(
-                    f"Error: backup {bak} would overwrite an input or schema file",
-                    file=sys.stderr,
-                )
+                message = f"backup {bak} would overwrite an input or schema file"
+                print(f"Error: {message}", file=sys.stderr)
                 return 1
 
     for file_path in args.files:
@@ -169,15 +158,11 @@ def main() -> int:
             exit_code = 1
             continue
 
-        fixes: Optional[FixResult] = None
+        fixes: FixResult | None = None
         if args.fix:
             try:
-                fixes = fix_file(
-                    p,
-                    tab_width=args.tab_width,
-                    fix_trailing_spaces=getattr(args, "check_trailing_spaces", True),
-                    backup=args.backup,
-                )
+                trailing = getattr(args, "check_trailing_spaces", True)
+                fixes = fix_file(p, args.tab_width, trailing, args.backup)
             except OSError as exc:
                 print(f"Error: {p}: {exc}", file=sys.stderr)
                 exit_code = 1
@@ -228,12 +213,11 @@ def _print_fixes(path: str, fixes: FixResult, quiet: bool = False) -> None:
         detail = ", ".join(f"{n} {rule}" for rule, n in fixes.fixed.items() if n)
         print(f"Fixed {fixes.total} issue(s) in {path} ({detail})")
     for rule, reason in fixes.skipped.items():
-        if quiet and rule != "no-tabs":
-            continue
-        print(f"Skipped {rule} fix in {path}: {reason}")
+        if not quiet or rule == "no-tabs":
+            print(f"Skipped {rule} fix in {path}: {reason}")
 
 
-def _print_json(result: ValidationResult, fixes: Optional[FixResult] = None) -> None:
+def _print_json(result: ValidationResult, fixes: FixResult | None = None) -> None:
     """Print validation result as JSON."""
     import json
 

@@ -1,5 +1,6 @@
 """Tests for ``--fix`` (issue #1)."""
 
+import errno
 import json
 import os
 import stat
@@ -759,7 +760,7 @@ def _have_setfacl(path):
     if shutil.which("setfacl") is None:
         return False
     probe = subprocess.run(
-        ["setfacl", "-m", "u:nobody:r", str(path)], capture_output=True
+        ["setfacl", "-m", "u:nobody:r", str(path)], capture_output=True, check=False
     )
     return probe.returncode == 0
 
@@ -898,29 +899,6 @@ def test_backup_dir_is_resolved_once(tmp_path, monkeypatch):
     v.fix_file(p, backup=True)
     assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
     assert not (other / "f.yaml.bak").exists()
-
-
-def _fake_xattrs(monkeypatch, v, source, inherited):
-    """Source has *source* xattrs; each new temp file inherits *inherited*."""
-    temps = {}
-
-    def key(fd):
-        return os.fstat(fd).st_ino
-
-    def listxattr(fd):
-        return list(temps.setdefault(key(fd), dict(inherited)))
-
-    def removexattr(fd, name):
-        temps[key(fd)].pop(name)
-
-    def setxattr(fd, name, value):
-        temps.setdefault(key(fd), dict(inherited))[name] = value
-
-    monkeypatch.setattr(v, "_read_xattrs", lambda fd: source)
-    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
-    monkeypatch.setattr(v.os, "removexattr", removexattr, raising=False)
-    monkeypatch.setattr(v.os, "setxattr", setxattr, raising=False)
-    return temps
 
 
 def test_identity_includes_ctime(tmp_path, monkeypatch):
@@ -1192,10 +1170,11 @@ def _fake_xattrs(
 @pytest.mark.parametrize(
     ("names", "get_error", "message"),
     [
-        (["system.posix_acl_access"], 0, "has a POSIX ACL"),
-        (["system.posix_acl_default"], 0, "has a POSIX ACL"),
-        (["security.ima"], 0, "has a security xattr"),
-        (["security.selinux"], 0, "has a security xattr"),
+        (["system.posix_acl_access"], 0, "attribute system.posix_acl_access"),
+        (["system.posix_acl_default"], 0, "attribute system.posix_acl_default"),
+        (["security.ima"], 0, "attribute security.ima"),
+        (["security.selinux"], 0, "attribute security.selinux"),
+        (["user.note"], 0, "only mode, group and owner"),
         (["user.note"], 95, "cannot read xattr user.note"),
         (["user.note"], 5, "cannot read xattr user.note"),
     ],
@@ -1218,15 +1197,27 @@ def test_fix_refuses_files_with_risky_xattrs(
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-def test_readable_user_xattr_is_fixed(
+def test_xattr_removed_during_run_is_absent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from yaml_validator.validator import fix_file
 
     p = write(tmp_path, "a: 1  \n")
-    _fake_xattrs(monkeypatch, ["user.note"])
+    _fake_xattrs(monkeypatch, ["user.note"], errno.ENODATA)
     fix_file(p)
     assert p.read_text() == "a: 1\n"
+
+
+def test_real_user_xattr_is_refused(tmp_path: Path) -> None:
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n")
+    if not _xattrs_supported(p):
+        pytest.skip("no user xattrs here")
+    with pytest.raises(OSError, match="user.probe"):
+        fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert os.getxattr(p, "user.probe") == b"1"
 
 
 @pytest.mark.parametrize(
@@ -1239,7 +1230,7 @@ def test_inherited_security_xattr_leaves_source_untouched(
 
     def listxattr(fd: int) -> list[str]:
         listed.append(fd)
-        return ["user.note"] if len(listed) == 1 else [name]
+        return [] if len(listed) == 1 else [name]
 
     def getxattr(fd: int, attr: str) -> bytes:
         return b"v"
@@ -1252,24 +1243,6 @@ def test_inherited_security_xattr_leaves_source_untouched(
         v.fix_file(p, backup=True)
     assert p.read_text() == "a: 1  \n"
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
-
-
-def test_security_xattr_present_on_source_is_not_inherited(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import yaml_validator.validator as v
-
-    seen: dict[str, list[str]] = {"names": []}
-
-    def names(fd: int) -> list[str]:
-        return seen["names"]
-
-    monkeypatch.setattr(v, "_xattr_names", names)
-    seen["names"] = ["security.selinux", "user.note"]
-    v._reject_inherited(0, Path("f.yaml"), ["security.selinux"])
-    seen["names"] = ["security.selinux", "security.ima"]
-    with pytest.raises(OSError, match="inherited security xattr security.ima"):
-        v._reject_inherited(0, Path("f.yaml"), ["security.selinux"])
 
 
 def _listxattr_sequence(
@@ -1422,7 +1395,7 @@ def test_unrepresentable_data_is_not_the_same() -> None:
 def test_cli_reports_fix_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    import yaml_validator.cli as cli
+    from yaml_validator import cli
 
     def broken(*args: object, **kwargs: object) -> None:
         raise OSError("disk on fire")
@@ -1438,3 +1411,64 @@ def test_cli_missing_file_is_an_error(tmp_path: Path) -> None:
     r = run("check", "--fix", "missing.yaml", cwd=tmp_path)
     assert r.returncode == 1
     assert "file not found" in r.stderr
+
+
+def test_fix_many_invalid_lines_with_trailing_tabs_is_fast() -> None:
+    import time
+
+    from yaml_validator.validator import fix_content
+
+    text = "a:\n" + "".join(f"\tk{i}: {i}\t\n" for i in range(2000))
+    start = time.perf_counter()
+    result = fix_content(text)
+    assert time.perf_counter() - start < 2
+    assert result.fixed == {"no-tabs": 2000, "trailing-spaces": 2000}
+
+
+def test_bad_constructor_is_reported_per_file(tmp_path: Path) -> None:
+    from yaml_validator.validator import fix_content
+
+    bad = write(tmp_path, "a: !!int x  \n", name="bad.yaml")
+    good = write(tmp_path, "b: 1\n", name="good.yaml")
+    r = run("check", "--fix", bad.name, good.name, cwd=tmp_path)
+    assert r.returncode == 1
+    assert "Traceback" not in r.stderr
+    assert "invalid literal" in r.stdout
+    assert "good.yaml" in r.stdout
+    assert "not valid YAML" in fix_content("a: !!int x  \n").skipped["trailing-spaces"]
+
+
+def test_owner_abort_suggests_running_as_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    real = p.stat()
+
+    def fchown(fd: int, uid: int, gid: int) -> None:
+        raise PermissionError(errno.EPERM, "nope")
+
+    monkeypatch.setattr(v.os, "fchown", fchown)
+    info = os.stat_result((real.st_mode, 0, 0, 0, real.st_uid + 1) + tuple(real)[5:])
+    with (
+        open(p, "rb") as f,
+        pytest.raises(OSError, match="run --fix as the file's owner"),
+    ):
+        v._keep_owner(f.fileno(), info, p)
+
+
+def test_validate_missing_file_and_schema_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yaml_validator.validator import validate_file
+
+    missing = validate_file(tmp_path / "nope.yaml")
+    assert missing.errors[0].rule == "io"
+    p = write(tmp_path, "a: 1\n")
+    schema = write(tmp_path, "type: 7\n", name="s.yaml")
+    bad = validate_file(p, schema_path=schema)
+    assert "Schema definition error" in bad.errors[0].message
+    monkeypatch.setitem(sys.modules, "jsonschema", None)
+    absent = validate_file(p, schema_path=schema)
+    assert absent.errors[0].rule == "dependency"
