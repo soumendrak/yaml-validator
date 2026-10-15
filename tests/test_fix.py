@@ -296,6 +296,8 @@ def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monke
         dir_fd = kwargs.get("src_dir_fd")
         if dir_fd is not None:  # resolve the dir_fd-relative temp name
             src = os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), src)
+        if kwargs.get("dst_dir_fd") is not None:
+            dst = Path(os.readlink(f"/proc/self/fd/{kwargs['dst_dir_fd']}")) / dst
         src = Path(src)
         calls.append((src, dst))
         assert src.parent.parent == target.parent
@@ -630,3 +632,56 @@ def test_fix_file_ignores_a_swapped_temp_directory(tmp_path, monkeypatch):
     assert swapped
     assert not p.is_symlink()
     assert p.read_text() == "a: 1\n"
+
+
+def test_incomplete_xattr_snapshot_does_not_strip_attributes(monkeypatch):
+    import yaml_validator.validator as v
+
+    def boom(fd, name=None):
+        raise PermissionError("policy")
+
+    monkeypatch.setattr(
+        v.os, "listxattr", lambda fd: ["security.selinux"], raising=False
+    )
+    monkeypatch.setattr(v.os, "getxattr", boom, raising=False)
+    assert v._read_xattrs(0) is None
+    removed = []
+    monkeypatch.setattr(
+        v.os, "removexattr", lambda fd, n: removed.append(n), raising=False
+    )
+    monkeypatch.setattr(v.os, "fchmod", lambda fd, mode: None, raising=False)
+    monkeypatch.setattr(v.os, "fchown", lambda fd, u, g: None, raising=False)
+    v._apply_metadata(0, "x", os.stat("."), None)
+    assert removed == []
+
+
+@pytest.mark.skipif(
+    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
+)
+def test_backup_dir_is_bound_before_ancestor_symlink_is_retargeted(
+    tmp_path, monkeypatch
+):
+    import yaml_validator.validator as v
+
+    real = tmp_path / "real"
+    other = tmp_path / "other"
+    real.mkdir()
+    other.mkdir()
+    link = tmp_path / "dir"
+    link.symlink_to(real)
+    p = link / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_mkdir = os.mkdir
+    flipped = []
+
+    def mkdir_then_retarget(name, mode=0o777, **kwargs):
+        real_mkdir(name, mode, **kwargs)
+        if not flipped:
+            link.unlink()
+            link.symlink_to(other)
+            flipped.append(True)
+
+    monkeypatch.setattr(v.os, "mkdir", mkdir_then_retarget)
+    v.fix_file(p, backup=True)
+    assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
+    assert not (other / "f.yaml.bak").exists()

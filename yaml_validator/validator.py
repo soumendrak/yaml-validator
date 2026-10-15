@@ -9,6 +9,7 @@ Provides:
 """
 
 import os
+import secrets
 import stat
 import tempfile
 from dataclasses import dataclass, field
@@ -416,27 +417,27 @@ def _identity(st: os.stat_result) -> tuple:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def _read_xattrs(fd: int) -> Dict[str, bytes]:
+def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
     """Best effort: the source's extended attributes, which hold POSIX ACLs
     (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
+
+    Returns None when the snapshot is incomplete (an attribute could not be
+    listed or read), so absent names are not mistaken for confirmed absence.
     """
     if not hasattr(os, "listxattr"):
         return {}
     attrs: Dict[str, bytes] = {}
     try:
         names = os.listxattr(fd)
-    except OSError:
-        return attrs
-    for name in names:
-        try:
+        for name in names:
             attrs[name] = os.getxattr(fd, name)
-        except OSError:
-            pass
+    except OSError:
+        return None
     return attrs
 
 
 def _apply_metadata(
-    fd: int, path: str, info: os.stat_result, attrs: Dict[str, bytes]
+    fd: int, path: str, info: os.stat_result, attrs: Optional[Dict[str, bytes]]
 ) -> None:
     """Give the open temp file *fd* the source's metadata, best effort.
 
@@ -452,7 +453,9 @@ def _apply_metadata(
                 os.fchown(fd, uid, gid)
             except PermissionError:
                 pass
-    if hasattr(os, "listxattr"):
+    # With an incomplete snapshot (None), leave the temp's attributes alone
+    # rather than strip ones the source may have.
+    if attrs is not None and hasattr(os, "listxattr"):
         try:
             inherited = os.listxattr(fd)
         except OSError:
@@ -479,49 +482,79 @@ def _atomic_write(
     dest: Path,
     data: bytes,
     info: os.stat_result,
-    attrs: Dict[str, bytes],
+    attrs: Optional[Dict[str, bytes]],
     before_replace=None,
 ) -> None:
     """Write *data* with the source's metadata, then rename it over *dest*.
 
-    The temp file lives in a fresh 0700 directory beside *dest*, and where
-    the platform allows, it is created and renamed through a descriptor for
-    that directory. Other users cannot swap the entry, even if they rename
-    the directory, so the inode written is the one renamed into place.
+    The temp file lives in a fresh 0700 directory beside *dest*. Where the
+    platform allows, *dest*'s directory is opened once and every step (mkdir,
+    create, rename, cleanup) goes through descriptors, so neither swapping
+    the temp entry nor retargeting a symlinked ancestor can redirect it.
     """
-    tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
-    # os.replace is renameat() on POSIX, like os.rename; only the latter is
-    # listed in supports_dir_fd.
     bound = os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd
-    dfd = None
-    name = "new" if bound else os.path.join(tmpdir, "new")
-    try:
-        if bound:
-            dfd = os.open(tmpdir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
-        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+    if not bound:  # e.g. Windows: plain paths
+        tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
+        name = os.path.join(tmpdir, "new")
         try:
-            view = memoryview(data)
-            while view:
-                view = view[os.write(fd, view) :]
-            _apply_metadata(fd, os.path.join(tmpdir, "new"), info, attrs)
+            _write_new(os.open(name, _NEW_FLAGS, 0o600), name, data, info, attrs)
+            if before_replace is not None:
+                before_replace()
+            os.replace(name, dest)
         finally:
-            os.close(fd)
-        if before_replace is not None:
-            before_replace()
-        os.replace(name, dest, src_dir_fd=dfd)
-    finally:
-        if dfd is not None or not bound:  # never a bare relative "new"
+            Path(name).unlink(missing_ok=True)
             try:
-                os.unlink(name, dir_fd=dfd)
-            except FileNotFoundError:
+                os.rmdir(tmpdir)
+            except OSError:
                 pass
-        if dfd is not None:
-            os.close(dfd)
+        return
+
+    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    pfd = os.open(dest.parent, dir_flags)
+    try:
+        tmpdir = f".yv-{secrets.token_hex(8)}"
+        os.mkdir(tmpdir, 0o700, dir_fd=pfd)
         try:
-            os.rmdir(tmpdir)
-        except OSError:
-            pass
+            dfd = os.open(tmpdir, dir_flags, dir_fd=pfd)
+            try:
+                fd = os.open("new", _NEW_FLAGS, 0o600, dir_fd=dfd)
+                where = os.path.join(dest.parent, tmpdir, "new")
+                _write_new(fd, where, data, info, attrs)
+                if before_replace is not None:
+                    before_replace()
+                os.replace("new", dest.name, src_dir_fd=dfd, dst_dir_fd=pfd)
+            finally:
+                try:
+                    os.unlink("new", dir_fd=dfd)
+                except FileNotFoundError:
+                    pass
+                os.close(dfd)
+        finally:
+            try:
+                os.rmdir(tmpdir, dir_fd=pfd)
+            except OSError:  # e.g. a look-alike planted under that name
+                pass
+    finally:
+        os.close(pfd)
+
+
+_NEW_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+
+
+def _write_new(
+    fd: int,
+    path: str,
+    data: bytes,
+    info: os.stat_result,
+    attrs: Optional[Dict[str, bytes]],
+) -> None:
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        _apply_metadata(fd, path, info, attrs)
+    finally:
+        os.close(fd)
 
 
 def fix_file(
@@ -557,7 +590,8 @@ def fix_file(
     )
     if result.fixed:
         if backup:
-            bak = path.with_name(path.name + ".bak")
+            # Beside the given path, with its directory resolved once.
+            bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
             # Build the new backup in a temp file, then swap it in, so a
             # failed write leaves the previous backup intact. os.replace
             # replaces a planted .bak symlink rather than following it.
