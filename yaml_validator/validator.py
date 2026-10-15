@@ -412,6 +412,10 @@ def fix_content(
     return result
 
 
+def _identity(st: os.stat_result) -> tuple:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
 def fix_file(
     path: Union[str, Path],
     tab_width: int = 2,
@@ -452,8 +456,8 @@ def fix_file(
             with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
                 stream.write(result.content)
             os.chmod(temporary, mode)
-            current = os.stat(target)
-            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+            # Same file, and not rewritten in place since it was read.
+            if _identity(os.stat(target)) != _identity(info):
                 raise OSError(
                     f"{target} changed while it was being fixed; not overwritten"
                 )

@@ -413,3 +413,22 @@ def test_fix_file_refuses_when_target_replaced_mid_run(tmp_path, monkeypatch):
         fix_file(p)
     assert p.read_text() == "other: 2\n"
     assert [x.name for x in tmp_path.iterdir()] == ["f.yaml"]
+
+
+def test_fix_file_refuses_when_target_rewritten_in_place(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def rewrite_then_fix(*args, **kwargs):
+        with open(p, "w") as stream:  # same inode, new contents
+            stream.write("newer: 3\n")
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", rewrite_then_fix)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        fix_file(p)
+    assert p.read_text() == "newer: 3\n"
