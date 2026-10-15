@@ -15,7 +15,7 @@ import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import yaml
 from yaml.error import MarkedYAMLError
@@ -419,16 +419,29 @@ def _identity(st: os.stat_result) -> tuple:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
+_XATTR_UNSUPPORTED = {
+    getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP") if hasattr(errno, name)
+}
+_ACL_PREFIX = "system.posix_acl_"
+_IMA_XATTR = "security.ima"
+
+
+def _protected_xattr(name: str) -> bool:
+    return name.startswith(_ACL_PREFIX) or name == _IMA_XATTR
+
+
+def _read_xattrs(fd: int) -> Optional[Dict[str, Optional[bytes]]]:
     """Best effort: the source's extended attributes, which hold POSIX ACLs
     (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
 
     Returns None only where xattrs are unsupported (no ``os.listxattr``, or
-    ENOTSUP/EOPNOTSUPP); then none are copied, but inherited ACLs are still
-    stripped. Any other failure raises: a partial snapshot could leave an
-    inherited ACL granting access the source never gave. So does ENOTSUP
-    reading an ACL that ``listxattr`` just listed: the source clearly has
-    one, so it must not be silently dropped.
+    ENOTSUP/EOPNOTSUPP when nothing listed is a POSIX ACL or ``security.ima``);
+    then none are copied, but inherited ACLs are still stripped. A value of
+    None was listed but ``getxattr`` returned ENOTSUP for that name alone:
+    it is not copied and not removed, so a readable ACL or IMA signature
+    beside it is kept. ENOTSUP on an ACL or ``security.ima`` raises, as does
+    any other failure. Those must not be dropped by treating the snapshot as
+    unsupported.
     """
     if not hasattr(os, "listxattr"):
         return None
@@ -438,21 +451,18 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
         if exc.errno in _XATTR_UNSUPPORTED:
             return None
         raise
-    attrs: Dict[str, bytes] = {}
+    protected = any(_protected_xattr(name) for name in names)
+    attrs: Dict[str, Optional[bytes]] = {}
     for name in names:
         try:
             attrs[name] = os.getxattr(fd, name)
         except OSError as exc:
-            if exc.errno in _XATTR_UNSUPPORTED and not name.startswith(_ACL_PREFIX):
+            if exc.errno not in _XATTR_UNSUPPORTED or _protected_xattr(name):
+                raise
+            if not protected:
                 return None
-            raise
+            attrs[name] = None
     return attrs
-
-
-_XATTR_UNSUPPORTED = {
-    getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP") if hasattr(errno, name)
-}
-_ACL_PREFIX = "system.posix_acl_"
 
 
 def _warn(message: str) -> None:
@@ -463,7 +473,7 @@ def _apply_metadata(
     fd: int,
     path: str,
     info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
+    attrs: Optional[Dict[str, Optional[bytes]]],
     mode: int,
     copy_owner: bool,
 ) -> None:
@@ -471,7 +481,9 @@ def _apply_metadata(
 
     Order: group, then owner, then xattrs (while the file is still 0600),
     then the mode. The source group must be on the temp before it is
-    renamed into place; owner restoration is best effort.
+    renamed into place; owner restoration is best effort. An xattr whose
+    value is None was listed on the source but could not be read, so it is
+    left untouched.
     """
     if copy_owner and hasattr(os, "fchown"):
         # Group first: a caller in the file's group may set the group even
@@ -518,6 +530,8 @@ def _apply_metadata(
                     raise  # an inherited ACL left in place could widen access
                 _warn(f"--fix: could not remove inherited xattr {name}: {exc}")
         for name, value in (attrs or {}).items():
+            if value is None:
+                continue
             try:
                 os.setxattr(fd, name, value)
             except OSError as exc:
@@ -535,7 +549,7 @@ def _write_new(
     path: str,
     data: bytes,
     info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
+    attrs: Optional[Dict[str, Optional[bytes]]],
     mode: int,
     copy_owner: bool,
 ) -> None:
@@ -548,14 +562,55 @@ def _write_new(
         os.close(fd)
 
 
+_MKSTEMP_RANDOM_LEN = 8
+
+
+def _component_limit(directory: Path) -> int:
+    fallback = 255
+    pathconf = getattr(os, "pathconf", None)
+    if not callable(pathconf):
+        return fallback
+    try:
+        raw = pathconf(directory, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        return fallback
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    return fallback
+
+
+def _temp_prefix(name: str, directory: Path) -> str:
+    """Prefix for ``mkstemp`` that leaves room for its random suffix.
+
+    ``tempfile`` appends eight characters. The prefix is ``.{name}.`` when
+    that fits in NAME_MAX, and otherwise the longest ``.{basename}.`` that
+    does.
+    """
+    room = _component_limit(directory) - _MKSTEMP_RANDOM_LEN
+    full = f".{name}."
+    if room >= len(os.fsencode(full)):
+        return full
+    if room <= 1:
+        return "."[: max(room, 0)]
+    body = os.fsencode(name)[: room - 2]
+    while body:
+        try:
+            text = body.decode("utf-8")
+        except UnicodeDecodeError:
+            body = body[:-1]
+            continue
+        return f".{text}."
+    return "."
+
+
 def _atomic_write(
     dest: Path,
     data: bytes,
     info: os.stat_result,
-    attrs: Optional[Dict[str, bytes]],
+    attrs: Optional[Dict[str, Optional[bytes]]],
     mode: int,
     copy_owner: bool = True,
-    before_replace=None,
+    before_replace: Optional[Callable[[], None]] = None,
 ) -> None:
     """Write *data* to a temp file beside *dest*, then rename it over *dest*.
 
@@ -567,7 +622,9 @@ def _atomic_write(
     temporary = None
     in_callback = False
     try:
-        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+        fd, temporary = tempfile.mkstemp(
+            dir=dest.parent, prefix=_temp_prefix(dest.name, dest.parent)
+        )
         _write_new(fd, temporary, data, info, attrs, mode, copy_owner)
         if before_replace is not None:
             in_callback = True
@@ -665,7 +722,7 @@ def fix_file(
                 f"cannot read extended attributes: {exc.strerror}",
                 str(target),
             ) from exc
-        if attrs and "security.ima" in attrs:
+        if attrs and _IMA_XATTR in attrs:
             raise OSError(
                 f"{target} has an IMA signature that would not match the "
                 "fixed content; not fixed"
@@ -686,7 +743,9 @@ def fix_file(
             # os.replace replaces a planted .bak symlink, not its target.
             # The backup is private: 0600, owned by the caller, and with no
             # ACLs or other xattrs ({}: strip any it inherits).
-            bak_attrs = None if attrs is None else {}
+            bak_attrs: Optional[Dict[str, Optional[bytes]]] = (
+                None if attrs is None else {}
+            )
             _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
             check()  # again: the target may have changed during the backup
 

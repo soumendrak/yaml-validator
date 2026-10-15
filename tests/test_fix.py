@@ -1434,3 +1434,260 @@ def test_ima_signed_file_is_refused(tmp_path, monkeypatch):
         v.fix_file(p, backup=True)
     assert p.read_text() == "a: 1  \n"
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def _xattr_views(monkeypatch, v, source_inode, source_names, inherited, read):
+    """Source fd lists *source_names*; each temp inherits *inherited*."""
+    import errno
+
+    removed, written = [], []
+
+    def listxattr(fd):
+        if os.fstat(fd).st_ino == source_inode:
+            return list(source_names)
+        return list(inherited)
+
+    def getxattr(fd, name):
+        if name not in read:
+            raise OSError(errno.ENODATA, "No data available")
+        value = read[name]
+        if isinstance(value, OSError):
+            raise value
+        return value
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v.os, "getxattr", getxattr, raising=False)
+    monkeypatch.setattr(
+        v.os, "removexattr", lambda fd, name: removed.append(name), raising=False
+    )
+    monkeypatch.setattr(
+        v.os, "setxattr", lambda fd, name, value: written.append((name, value)), raising=False
+    )
+    return removed, written
+
+
+@pytest.mark.parametrize("err", ["ENOTSUP", "EOPNOTSUPP"])
+def test_unrelated_getxattr_enotsup_keeps_readable_acl(tmp_path, monkeypatch, err):
+    """An ordinary attribute's ENOTSUP must not drop a listed ACL."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    acl = "system.posix_acl_access"
+    code = getattr(errno, err)
+    p = write(tmp_path, "a: 1  \n")
+    removed, written = _xattr_views(
+        monkeypatch,
+        v,
+        p.stat().st_ino,
+        ["user.other", "security.selinux", acl],
+        [acl, "user.other", "security.selinux"],
+        {
+            "user.other": OSError(code, "Operation not supported"),
+            "security.selinux": b"ctx",
+            acl: b"source-acl",
+        },
+    )
+    v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+    assert removed == [acl]
+    assert written == [("security.selinux", b"ctx"), (acl, b"source-acl")]
+
+
+@pytest.mark.parametrize("err", ["ENOTSUP", "EOPNOTSUPP"])
+def test_unrelated_getxattr_enotsup_still_refuses_ima(tmp_path, monkeypatch, err):
+    import errno
+
+    import yaml_validator.validator as v
+
+    code = getattr(errno, err)
+    p = write(tmp_path, "a: 1  \n")
+    _xattr_views(
+        monkeypatch,
+        v,
+        p.stat().st_ino,
+        ["user.other", "security.ima"],
+        [],
+        {
+            "user.other": OSError(code, "Operation not supported"),
+            "security.ima": b"sig",
+        },
+    )
+    with pytest.raises(OSError, match="IMA signature"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_ima_enotsup_on_getxattr_aborts(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    _xattr_views(
+        monkeypatch,
+        v,
+        p.stat().st_ino,
+        ["security.ima"],
+        [],
+        {"security.ima": OSError(errno.ENOTSUP, "Operation not supported")},
+    )
+    with pytest.raises(OSError, match="cannot read extended attributes") as info:
+        v.fix_file(p)
+    assert info.value.filename == str(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_acl_enotsup_aborts_after_a_readable_xattr(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    acl = "system.posix_acl_access"
+    p = write(tmp_path, "a: 1  \n")
+    _xattr_views(
+        monkeypatch,
+        v,
+        p.stat().st_ino,
+        ["user.other", acl],
+        [],
+        {
+            "user.other": b"ok",
+            acl: OSError(errno.ENOTSUP, "Operation not supported"),
+        },
+    )
+    with pytest.raises(OSError, match="cannot read extended attributes"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_source_listxattr_error_aborts(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    def listxattr(fd):
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="cannot read extended attributes") as info:
+        v.fix_file(p)
+    assert info.value.filename == str(p)
+    assert info.value.errno == errno.EIO
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_enotsup_on_ordinary_xattr_still_strips_inherited_acls(tmp_path, monkeypatch):
+    """ENOTSUP with no ACL or IMA still means the snapshot is unsupported."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    acl = "system.posix_acl_access"
+    p = write(tmp_path, "a: 1  \n")
+    removed, written = _xattr_views(
+        monkeypatch,
+        v,
+        p.stat().st_ino,
+        ["user.other"],
+        [acl, "security.selinux"],
+        {"user.other": OSError(errno.ENOTSUP, "Operation not supported")},
+    )
+    v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+    assert removed == [acl]
+    assert written == []
+
+
+def test_temp_prefix_uses_the_basename_when_it_fits(tmp_path):
+    import yaml_validator.validator as v
+
+    assert v._temp_prefix("f.yaml", tmp_path) == ".f.yaml."
+
+
+def test_temp_prefix_stays_within_name_max(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v, "_component_limit", lambda directory: 255)
+    name = "n" * 250
+    prefix = v._temp_prefix(name, tmp_path)
+    assert len(os.fsencode(prefix)) + v._MKSTEMP_RANDOM_LEN <= 255
+    assert prefix.startswith(".")
+    assert prefix.endswith(".")
+    assert name.encode() not in os.fsencode(prefix)
+
+
+def test_temp_prefix_keeps_a_whole_character(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v, "_component_limit", lambda directory: 12)
+    assert v._temp_prefix("é" + "a" * 40, tmp_path) == ".é."
+
+
+def test_temp_prefix_does_not_split_utf8(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v, "_component_limit", lambda directory: 11)
+    assert v._temp_prefix("éyaml", tmp_path) == "."
+
+
+def test_temp_prefix_shrinks_when_the_limit_is_tiny(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v, "_component_limit", lambda directory: 8)
+    assert v._temp_prefix("f.yaml", tmp_path) == ""
+    monkeypatch.setattr(v, "_component_limit", lambda directory: 9)
+    assert v._temp_prefix("f.yaml", tmp_path) == "."
+
+
+def test_component_limit_falls_back(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    def boom(*_args):
+        raise OSError("nope")
+
+    monkeypatch.setattr(v.os, "pathconf", boom, raising=False)
+    assert v._component_limit(tmp_path) == 255
+
+    def bad(*_args):
+        raise ValueError("unknown")
+
+    monkeypatch.setattr(v.os, "pathconf", bad, raising=False)
+    assert v._component_limit(tmp_path) == 255
+    monkeypatch.setattr(v.os, "pathconf", lambda *_a: -1, raising=False)
+    assert v._component_limit(tmp_path) == 255
+    monkeypatch.setattr(v.os, "pathconf", lambda *_a: 0, raising=False)
+    assert v._component_limit(tmp_path) == 255
+    monkeypatch.setattr(v.os, "pathconf", lambda *_a: "no", raising=False)
+    assert v._component_limit(tmp_path) == 255
+    monkeypatch.delattr(v.os, "pathconf", raising=False)
+    assert v._component_limit(tmp_path) == 255
+
+
+def test_long_basename_temp_file_fits_name_max(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    limit = os.pathconf(tmp_path, "PC_NAME_MAX")
+    stem = "n" * ((limit - 5) - len(".yaml"))
+    name = stem + ".yaml"
+    assert len(os.fsencode(name)) == limit - 5
+    p = write(tmp_path, "k: 1  \n", name)
+    seen = []
+    real = v.tempfile.mkstemp
+
+    def spy(*args, **kwargs):
+        prefix = kwargs.get("prefix", args[1] if len(args) > 1 else None)
+        assert prefix is not None
+        assert len(os.fsencode(prefix)) + v._MKSTEMP_RANDOM_LEN <= limit
+        fd, path = real(*args, **kwargs)
+        seen.append(os.path.basename(path))
+        return fd, path
+
+    monkeypatch.setattr(v.tempfile, "mkstemp", spy)
+    v.fix_file(p)
+    assert seen
+    assert all(len(os.fsencode(temp)) <= limit for temp in seen)
+    assert p.read_text() == "k: 1\n"
