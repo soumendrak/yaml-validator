@@ -219,3 +219,161 @@ def test_fix_quiet_hides_skipped_warnings(tmp_path):
     r = run("check", "--fix", "--quiet", p.name, cwd=tmp_path)
     assert "Skipped" not in r.stdout
     assert r.returncode == 0
+
+
+def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \r\n")
+    p.chmod(0o640)
+    bak = p.with_suffix(".yaml.bak")
+    real_open = os.open
+    creations = []
+
+    def observe_open(path, flags, mode=0o777, **kwargs):
+        fd = real_open(path, flags, mode, **kwargs)
+        if Path(path) == bak:
+            creations.append((flags, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
+        return fd
+
+    monkeypatch.setattr(os, "open", observe_open)
+    fix_file(p, backup=True)
+    assert creations == [(os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, 0o600)]
+    assert bak.read_bytes() == b"a: 1  \r\n"
+    assert stat.S_IMODE(bak.stat().st_mode) == 0o640
+
+
+def test_backup_replaces_existing_wider_mode_file(tmp_path):
+    import stat
+
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "secret: x  \n")
+    p.chmod(0o600)
+    bak = write(tmp_path, "old backup", "f.yaml.bak")
+    bak.chmod(0o666)
+    fix_file(p, backup=True)
+    assert bak.read_bytes() == b"secret: x  \n"
+    assert stat.S_IMODE(bak.stat().st_mode) == 0o600
+
+
+def test_backup_replaces_symlink_without_following(tmp_path):
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n")
+    victim = write(tmp_path, "untouched", "victim")
+    bak = tmp_path / "f.yaml.bak"
+    bak.symlink_to(victim)
+    fix_file(p, backup=True)
+    assert not bak.is_symlink()
+    assert bak.read_bytes() == b"a: 1  \n"
+    assert victim.read_bytes() == b"untouched"
+
+
+def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    from yaml_validator.validator import fix_file
+
+    target_dir = tmp_path / "target"
+    target_dir.mkdir()
+    target = write(target_dir, "a: 1  \n")
+    target.chmod(0o640)
+    link = tmp_path / "link.yaml"
+    link.symlink_to(target)
+    real_replace = os.replace
+    calls = []
+
+    def observe_replace(src, dst):
+        src = Path(src)
+        calls.append((src, dst))
+        assert src.parent == target.parent
+        assert target.read_bytes() == b"a: 1  \n"
+        assert src.read_bytes() == b"a: 1\n"
+        assert stat.S_IMODE(src.stat().st_mode) == 0o640
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    fix_file(link)
+    assert len(calls) == 1
+    assert calls[0][1] == target
+    assert not calls[0][0].exists()
+    assert link.is_symlink()
+    assert target.read_bytes() == link.read_bytes() == b"a: 1\n"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_replace_permission_error_is_clean_and_cleans_temp(
+    tmp_path, monkeypatch, capsys
+):
+    import os
+
+    from yaml_validator.cli import main
+
+    p = write(tmp_path, "a: 1  \n")
+
+    def denied(src, dst):
+        raise PermissionError(13, "Permission denied", str(dst))
+
+    monkeypatch.setattr(os, "replace", denied)
+    monkeypatch.setattr(sys, "argv", ["yaml-validator", "check", "--fix", str(p)])
+    assert main() == 1
+    output = capsys.readouterr()
+    assert "Error:" in output.err
+    assert "Permission denied" in output.err
+    assert "Traceback" not in output.out + output.err
+    assert p.read_bytes() == b"a: 1  \n"
+    assert list(tmp_path.iterdir()) == [p]
+
+
+def test_fix_no_changes_leaves_mtime_content_and_no_backup(tmp_path):
+    import os
+
+    p = write(tmp_path, "a: 1\n")
+    os.utime(p, ns=(1_000_000_000, 1_000_000_000))
+    before = p.stat().st_mtime_ns
+    r = run("check", "--fix", "--backup", p.name, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert p.read_bytes() == b"a: 1\n"
+    assert p.stat().st_mtime_ns == before
+    assert not (tmp_path / "f.yaml.bak").exists()
+
+
+def test_valid_file_missing_eof_newline_is_reported(tmp_path):
+    p = write(tmp_path, "a: 1")
+    r = run("check", "--json", p.name, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["valid"] is True
+    assert [w["rule"] for w in payload["warnings"]] == ["end-of-file-newline"]
+
+
+def test_empty_file_has_no_eof_warning_or_fix(tmp_path):
+    p = write(tmp_path, "")
+    r = run("check", "--fix", "--backup", "--json", p.name, cwd=tmp_path)
+    assert r.returncode == 0, r.stdout + r.stderr
+    payload = json.loads(r.stdout)
+    assert payload["warnings"] == []
+    assert payload["fixed"] == {}
+    assert p.read_bytes() == b""
+    assert not (tmp_path / "f.yaml.bak").exists()
+
+
+def test_fix_quiet_suppresses_success_output(tmp_path):
+    p = write(tmp_path, "a: 1  \n")
+    r = run("check", "--fix", "--quiet", p.name, cwd=tmp_path)
+    assert r.returncode == 0
+    assert r.stdout == r.stderr == ""
+    assert p.read_bytes() == b"a: 1\n"
+
+
+def test_zero_tab_width_is_rejected(tmp_path):
+    p = write(tmp_path, "a:\n\tb: 1\n")
+    r = run("check", "--fix", "--tab-width", "0", p.name, cwd=tmp_path)
+    assert r.returncode == 2
+    assert "--tab-width must be at least 1" in r.stderr
+    assert p.read_bytes() == b"a:\n\tb: 1\n"

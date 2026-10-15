@@ -164,23 +164,28 @@ def main() -> int:
             exit_code = 1
             continue
 
-        fixes = None
-        if args.fix:
-            fixes = fix_file(
-                p,
-                tab_width=args.tab_width,
-                fix_trailing_spaces=getattr(args, "check_trailing_spaces", True),
-                backup=args.backup,
-            )
+        try:
+            fixes = None
+            if args.fix:
+                fixes = fix_file(
+                    p,
+                    tab_width=args.tab_width,
+                    fix_trailing_spaces=getattr(args, "check_trailing_spaces", True),
+                    backup=args.backup,
+                )
 
-        result = validate_file(
-            path=p,
-            schema_path=args.schema if getattr(args, "schema", None) else None,
-            multi_document=args.multi,
-            check_line_length=getattr(args, "check_line_length", True),
-            check_trailing_spaces=getattr(args, "check_trailing_spaces", True),
-            max_line_length=getattr(args, "max_line_length", 200),
-        )
+            result = validate_file(
+                path=p,
+                schema_path=args.schema if getattr(args, "schema", None) else None,
+                multi_document=args.multi,
+                check_line_length=getattr(args, "check_line_length", True),
+                check_trailing_spaces=getattr(args, "check_trailing_spaces", True),
+                max_line_length=getattr(args, "max_line_length", 200),
+            )
+        except OSError as exc:
+            print(f"Error: {p}: {exc}", file=sys.stderr)
+            exit_code = 1
+            continue
 
         all_results.append(result)
         if not result.is_valid:

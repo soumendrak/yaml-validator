@@ -9,8 +9,8 @@ Provides:
 """
 
 import os
-import re
-import shutil
+import stat
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -432,12 +432,26 @@ def fix_file(
         fix_trailing_spaces=fix_trailing_spaces,
     )
     if result.fixed:
+        mode = stat.S_IMODE(path.stat().st_mode)
         if backup:
-            # copy2 also copies the permission bits, so a 0600 config does
-            # not end up with a world-readable backup.
-            shutil.copy2(path, path.with_name(path.name + ".bak"))
+            bak = path.with_name(path.name + ".bak")
+            bak.unlink(missing_ok=True)  # Remove symlinks rather than following them.
+            fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(raw)
+                stream.flush()
+                os.fchmod(stream.fileno(), mode)
         newline = "\r\n" if b"\r\n" in raw else "\n"
-        path.write_text(result.content, encoding="utf-8", newline=newline)
+        target = Path(os.path.realpath(path))
+        fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
+                stream.write(result.content)
+                stream.flush()
+                os.fchmod(stream.fileno(), mode)
+            os.replace(temporary, target)
+        finally:
+            Path(temporary).unlink(missing_ok=True)
     return result
 
 
