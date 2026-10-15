@@ -1198,3 +1198,135 @@ def test_target_rechecked_after_backup_write(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="changed while it was being fixed"):
         v.fix_file(p, backup=True)
     assert p.read_text() == "newer: 1\n"
+
+
+def test_backup_enospc_names_the_bak(tmp_path, monkeypatch):
+    """A failed .bak write names the .bak, not the target."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    real_write = v.os.write
+    calls = {"n": 0}
+
+    def full_on_second(fd, data):
+        calls["n"] += 1
+        if calls["n"] == 2:  # first write is the fixed temp, second the .bak
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(v.os, "write", full_on_second)
+    with pytest.raises(OSError, match="No space") as info:
+        v.fix_file(p, backup=True)
+    assert info.value.filename == str(tmp_path / "f.yaml.bak")
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_backup_in_read_only_symlink_dir_names_the_bak(tmp_path):
+    """A writable target behind a symlink in a read-only dir: the error is
+    about the .bak beside the link, not the (writable) target."""
+    from yaml_validator.validator import fix_file
+
+    if os.name == "nt" or os.geteuid() == 0:
+        pytest.skip("needs POSIX permissions as a non-root user")
+    real, ro = tmp_path / "real", tmp_path / "ro"
+    real.mkdir()
+    ro.mkdir()
+    t = write(real, "a: 1  \n", name="t.yaml")
+    link = ro / "t.yaml"
+    link.symlink_to(t)
+    ro.chmod(0o500)
+    try:
+        with pytest.raises(PermissionError) as info:
+            fix_file(link, backup=True)
+    finally:
+        ro.chmod(0o700)
+    assert info.value.filename == str(ro / "t.yaml.bak")
+    assert t.read_text() == "a: 1  \n"
+
+
+def test_backup_is_written_beside_the_symlink(tmp_path):
+    """Z27: the .bak goes next to the given path, not next to its target."""
+    from yaml_validator.validator import fix_file
+
+    real, links = tmp_path / "real", tmp_path / "links"
+    real.mkdir()
+    links.mkdir()
+    t = write(real, "a: 1  \n", name="t.yaml")
+    link = links / "l.yaml"
+    link.symlink_to(t)
+    fix_file(link, backup=True)
+    assert t.read_text() == "a: 1\n"
+    assert (links / "l.yaml.bak").read_text() == "a: 1  \n"
+    assert sorted(x.name for x in real.iterdir()) == ["t.yaml"]
+
+
+def test_source_acl_enotsup_on_getxattr_aborts(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    def unsupported(fd, name):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(
+        v.os, "listxattr", lambda fd: ["system.posix_acl_access"], raising=False
+    )
+    monkeypatch.setattr(v.os, "getxattr", unsupported, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="cannot read extended attributes"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_temp_listxattr_enotsup_aborts_when_source_has_acl(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    def listxattr(fd):
+        raise OSError(errno.ENOTSUP, "Operation not supported")
+
+    monkeypatch.setattr(
+        v, "_read_xattrs", lambda fd: {"system.posix_acl_access": b"acl"}
+    )
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="not supported"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_backup_aliasing_the_target_is_refused(tmp_path):
+    from yaml_validator.validator import fix_file
+
+    t = write(tmp_path, "a: 1  \n", name="f.yaml.bak")
+    link = tmp_path / "f.yaml"
+    link.symlink_to(t)
+    with pytest.raises(OSError, match="is the file being fixed"):
+        fix_file(link, backup=True)
+    assert t.read_text() == "a: 1  \n"
+
+
+def test_backup_onto_another_input_is_refused(tmp_path):
+    a = write(tmp_path, "a: 1  \n", name="a.yaml")
+    b = write(tmp_path, "b: 1  \n", name="a.yaml.bak")
+    r = run("check", "--fix", "--backup", str(a), str(b), cwd=tmp_path)
+    assert r.returncode == 1
+    assert "would overwrite an input file" in r.stderr
+    assert a.read_text() == "a: 1  \n"
+    assert b.read_text() == "b: 1  \n"
+
+
+def test_ima_signed_file_is_refused(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {"security.ima": b"sig"})
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="IMA signature"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]

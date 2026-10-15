@@ -426,18 +426,26 @@ def _read_xattrs(fd: int) -> Optional[Dict[str, bytes]]:
     Returns None only where xattrs are unsupported (no ``os.listxattr``, or
     ENOTSUP/EOPNOTSUPP); then none are copied, but inherited ACLs are still
     stripped. Any other failure raises: a partial snapshot could leave an
-    inherited ACL granting access the source never gave.
+    inherited ACL granting access the source never gave. So does ENOTSUP
+    reading an ACL that ``listxattr`` just listed: the source clearly has
+    one, so it must not be silently dropped.
     """
     if not hasattr(os, "listxattr"):
         return None
-    attrs: Dict[str, bytes] = {}
     try:
-        for name in os.listxattr(fd):
-            attrs[name] = os.getxattr(fd, name)
+        names = os.listxattr(fd)
     except OSError as exc:
         if exc.errno in _XATTR_UNSUPPORTED:
             return None
         raise
+    attrs: Dict[str, bytes] = {}
+    for name in names:
+        try:
+            attrs[name] = os.getxattr(fd, name)
+        except OSError as exc:
+            if exc.errno in _XATTR_UNSUPPORTED and not name.startswith(_ACL_PREFIX):
+                return None
+            raise
     return attrs
 
 
@@ -476,7 +484,11 @@ def _apply_metadata(
         try:
             inherited = os.listxattr(fd)
         except OSError as exc:
-            if exc.errno not in _XATTR_UNSUPPORTED:
+            # ENOTSUP is only "nothing inherited" if the source had no ACL;
+            # otherwise the source's ACL could not be checked against it.
+            if exc.errno not in _XATTR_UNSUPPORTED or any(
+                name.startswith(_ACL_PREFIX) for name in attrs or {}
+            ):
                 raise
             inherited = []  # no xattrs here, so nothing can be inherited
         # Inherited ACLs (e.g. from a default ACL) are always stripped first;
@@ -536,16 +548,22 @@ def _atomic_write(
 
     ``mkstemp`` creates the temp file with ``O_EXCL`` at 0600; metadata is
     applied through its descriptor before the rename. OS errors name *dest*,
-    not the temp file.
+    not the temp file; errors from *before_replace* (e.g. writing the .bak)
+    keep their own filename.
     """
     temporary = None
+    in_callback = False
     try:
         fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
         _write_new(fd, temporary, data, info, attrs, mode, copy_owner)
         if before_replace is not None:
+            in_callback = True
             before_replace()
+            in_callback = False
         os.replace(temporary, dest)
     except OSError as exc:
+        if in_callback:
+            raise
         if exc.errno is not None and exc.filename != str(dest):
             raise type(exc)(exc.errno, exc.strerror, str(dest)) from exc
         raise
@@ -588,6 +606,17 @@ def fix_file(
     extended attributes (ACLs, SELinux labels). On filesystems without
     xattr support, xattrs are simply not copied. Renaming breaks hard
     links: other names for the file keep the old content.
+
+    With ``backup=True``, the .bak is written just before the final rename.
+    If the target is then found to have changed (a concurrent writer), the
+    fix is aborted but the previous .bak has already been replaced by the
+    snapshot that was read, which no longer matches the target. Likewise,
+    if the final rename fails, e.g. with EPERM in a sticky directory (such
+    as /tmp) where the target belongs to another user, the new .bak is left
+    behind even though the target was not fixed.
+
+    Files with an IMA signature (``security.ima``) are refused: the
+    signature covers the old bytes and cannot be regenerated here.
     """
     path = Path(path)
     # Resolve once, then read and replace that same target, so a symlink
@@ -595,6 +624,9 @@ def fix_file(
     target = Path(os.path.realpath(path))
     # The .bak goes beside the given path, with its directory resolved now.
     bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
+    if backup and os.path.realpath(bak) == str(target):
+        # e.g. f.yaml -> f.yaml.bak: the backup would overwrite the source.
+        raise OSError(f"{bak} is the file being fixed; not fixed")
     with open(target, "rb") as source:
         before = os.fstat(source.fileno())
         raw = source.read()
@@ -618,6 +650,11 @@ def fix_file(
                 f"cannot read extended attributes: {exc.strerror}",
                 str(target),
             ) from exc
+        if attrs and "security.ima" in attrs:
+            raise OSError(
+                f"{target} has an IMA signature that would not match the "
+                "fixed content; not fixed"
+            )
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
 

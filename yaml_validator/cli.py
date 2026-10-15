@@ -7,6 +7,7 @@ Usage:
     yaml-validator --help
 """
 
+import os
 import sys
 from pathlib import Path
 
@@ -156,6 +157,19 @@ def main() -> int:
 
     all_results = []
     exit_code = 0
+
+    if args.fix and args.backup:
+        # A .bak must not land on another input (e.g. a.yaml and a.yaml.bak
+        # both given): that input would be overwritten before it is fixed.
+        targets = {os.path.realpath(f) for f in args.files}
+        for f in args.files:
+            bak = os.path.join(os.path.dirname(f) or ".", os.path.basename(f) + ".bak")
+            if os.path.realpath(bak) in targets:
+                print(
+                    f"Error: backup {bak} would overwrite an input file",
+                    file=sys.stderr,
+                )
+                return 1
 
     for file_path in args.files:
         p = Path(file_path)
