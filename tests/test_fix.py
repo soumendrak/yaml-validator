@@ -1140,13 +1140,20 @@ def test_identity_includes_dev_and_inode(tmp_path, monkeypatch):
     p.write_text("a: 1  \n")
     real_stat = os.stat
 
+    class OtherInode:
+        def __init__(self, r):
+            self._r = r
+
+        def __getattr__(self, name):
+            return getattr(self._r, name)
+
+        @property
+        def st_ino(self):
+            return self._r.st_ino + 1
+
     def other_inode(path, *args, **kwargs):
         r = real_stat(path, *args, **kwargs)
-        if str(path) == str(p):
-            fields = list(r)
-            fields[1] += 1  # st_ino
-            return os.stat_result(fields + [r.st_atime, r.st_mtime, r.st_ctime][:0])
-        return r
+        return OtherInode(r) if str(path) == str(p) else r
 
     monkeypatch.setattr(v.os, "stat", other_inode)
     with pytest.raises(OSError, match="changed while it was being fixed"):
