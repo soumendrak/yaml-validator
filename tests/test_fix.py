@@ -442,22 +442,11 @@ def test_failed_backup_write_keeps_old_backup(tmp_path, monkeypatch):
     p.write_text("a: 1  \n")
     bak = tmp_path / "f.yaml.bak"
     bak.write_text("old backup\n")
-    real_fdopen = os.fdopen
 
-    class FullDisk:
-        def __init__(self, fd, *a, **k):
-            self._f = real_fdopen(fd, *a, **k)
+    def full_disk(fd, data):
+        raise OSError(28, "No space left on device")
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            self._f.close()
-
-        def write(self, data):
-            raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(v.os, "fdopen", FullDisk)
+    monkeypatch.setattr(v.os, "write", full_disk)
     with pytest.raises(OSError, match="No space"):
         fix_file(p, backup=True)
     assert bak.read_text() == "old backup\n"
@@ -494,7 +483,7 @@ def test_fix_file_ignores_permission_error_from_chown(tmp_path, monkeypatch):
     def deny(*args, **kwargs):
         raise PermissionError("not root")
 
-    monkeypatch.setattr(os, "chown", deny, raising=False)
+    monkeypatch.setattr(os, "fchown", deny, raising=False)
     p = tmp_path / "f.yaml"
     p.write_text("a: 1  \n")
     fix_file(p, backup=True)
@@ -572,15 +561,62 @@ def test_fix_file_sets_group_even_when_owner_change_is_denied(tmp_path, monkeypa
 
     calls = []
 
-    def fake_chown(path, uid, gid):
-        calls.append((Path(path).name.startswith("."), uid, gid))
+    def fake_fchown(fd, uid, gid):
+        calls.append((uid, gid))
         if uid != -1:
             raise PermissionError("only root may change the owner")
 
     monkeypatch.setattr(v.os, "fstat", fake_fstat)
-    monkeypatch.setattr(v.os, "chown", fake_chown, raising=False)
+    monkeypatch.setattr(v.os, "fchown", fake_fchown, raising=False)
     monkeypatch.setattr(v, "_identity", lambda st: None)
     v.fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
     # bak temp, then fixed temp: group set first, then owner attempted.
-    assert calls == [(True, -1, group), (True, owner, -1)] * 2
+    assert calls == [(-1, group), (owner, -1)] * 2
+
+
+@pytest.mark.skipif(not hasattr(os, "removexattr"), reason="no xattr support")
+def test_fix_file_drops_xattrs_the_source_lacks(tmp_path, monkeypatch):
+    """An ACL inherited from the directory must not survive on the temp."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    removed = []
+    real_listxattr = os.listxattr
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: {})
+    monkeypatch.setattr(
+        v.os,
+        "listxattr",
+        lambda fd: ["system.posix_acl_access"]
+        if isinstance(fd, int)
+        else real_listxattr(fd),
+    )
+    monkeypatch.setattr(v.os, "removexattr", lambda fd, name: removed.append(name))
+    v.fix_file(p, backup=True)
+    assert removed == ["system.posix_acl_access"] * 2
+
+
+def test_fix_file_refuses_when_temp_entry_is_swapped(tmp_path, monkeypatch):
+    """Metadata goes through the fd; a swapped temp name aborts the replace."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    victim = tmp_path / "victim"
+    victim.write_text("keep\n")
+    real_close = os.close
+
+    def close_then_swap(fd):
+        real_close(fd)
+        for entry in tmp_path.iterdir():
+            if entry.name.startswith(".f.yaml."):
+                link = tmp_path / "planted"
+                link.symlink_to(victim)  # made while the temp still exists
+                os.replace(link, entry)
+
+    monkeypatch.setattr(v.os, "close", close_then_swap)
+    with pytest.raises(OSError, match="was replaced while it was being written"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert victim.read_text() == "keep\n"

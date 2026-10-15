@@ -417,41 +417,81 @@ def _identity(st: os.stat_result) -> tuple:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
-def _copy_owner(path: Union[str, Path], info: os.stat_result) -> None:
-    """Best effort: give *path* the source's owner and group.
-
-    An unprivileged user can still set any group they belong to; changing
-    the owner needs root, so a PermissionError is ignored.
-    """
-    if not hasattr(os, "chown"):  # Windows
-        return
-    # Group first: a non-owner in the file's group may set the group even
-    # though changing the owner needs root.
-    for uid, gid in ((-1, info.st_gid), (info.st_uid, -1)):
-        try:
-            os.chown(path, uid, gid)
-        except PermissionError:
-            pass
-
-
-def _copy_xattrs(src: Union[str, Path], dst: Union[str, Path]) -> None:
-    """Best effort: copy extended attributes, which hold POSIX ACLs
+def _read_xattrs(fd: int) -> Dict[str, bytes]:
+    """Best effort: the source's extended attributes, which hold POSIX ACLs
     (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
-
-    Attributes the caller may not set are skipped. No-op where the
-    platform has no xattr support.
     """
     if not hasattr(os, "listxattr"):
-        return
+        return {}
+    attrs: Dict[str, bytes] = {}
     try:
-        names = os.listxattr(src)
+        names = os.listxattr(fd)
     except OSError:
-        return
+        return attrs
     for name in names:
         try:
-            os.setxattr(dst, name, os.getxattr(src, name))
+            attrs[name] = os.getxattr(fd, name)
         except OSError:
             pass
+    return attrs
+
+
+def _apply_metadata(
+    fd: int, path: str, info: os.stat_result, attrs: Dict[str, bytes]
+) -> None:
+    """Give the open temp file *fd* the source's metadata, best effort.
+
+    Everything goes through the descriptor, so a swapped directory entry
+    cannot redirect it. Order: owner/group, then xattrs (while the file is
+    still 0600), then the mode.
+    """
+    if hasattr(os, "fchown"):
+        # Group first: a non-owner in the file's group may set the group
+        # even though changing the owner needs root.
+        for uid, gid in ((-1, info.st_gid), (info.st_uid, -1)):
+            try:
+                os.fchown(fd, uid, gid)
+            except PermissionError:
+                pass
+    if hasattr(os, "listxattr"):
+        try:
+            inherited = os.listxattr(fd)
+        except OSError:
+            inherited = []
+        for name in inherited:  # e.g. an ACL inherited from the directory
+            if name not in attrs:
+                try:
+                    os.removexattr(fd, name)
+                except OSError:
+                    pass
+        for name, value in attrs.items():
+            try:
+                os.setxattr(fd, name, value)
+            except OSError:
+                pass
+    mode = stat.S_IMODE(info.st_mode)
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, mode)
+    else:  # Windows
+        os.chmod(path, mode)
+
+
+def _write_temp(
+    fd: int, path: str, data: bytes, info: os.stat_result, attrs: Dict[str, bytes]
+) -> None:
+    """Write *data* and metadata to *fd*, close it, and check that *path*
+    still names that file."""
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view) :]
+        _apply_metadata(fd, path, info, attrs)
+        written = os.fstat(fd)
+    finally:
+        os.close(fd)
+    now = os.lstat(path)
+    if (now.st_dev, now.st_ino) != (written.st_dev, written.st_ino):
+        raise OSError(f"{path} was replaced while it was being written")
 
 
 def fix_file(
@@ -478,6 +518,7 @@ def fix_file(
     with open(target, "rb") as source:
         raw = source.read()
         info = os.fstat(source.fileno())
+        attrs = _read_xattrs(source.fileno())
     result = fix_content(
         # Universal newlines, as read_text() would give.
         raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
@@ -485,7 +526,6 @@ def fix_file(
         fix_trailing_spaces=fix_trailing_spaces,
     )
     if result.fixed:
-        mode = stat.S_IMODE(info.st_mode)
         if backup:
             bak = path.with_name(path.name + ".bak")
             # Build the new backup beside the old one, then swap it in, so a
@@ -494,22 +534,15 @@ def fix_file(
             tmp_bak = bak.with_name(f".{bak.name}.{secrets.token_hex(8)}.tmp")
             fd = os.open(tmp_bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(raw)
-                _copy_owner(tmp_bak, info)
-                os.chmod(tmp_bak, mode)
-                _copy_xattrs(target, tmp_bak)
+                _write_temp(fd, str(tmp_bak), raw, info, attrs)
                 os.replace(tmp_bak, bak)
             finally:
                 tmp_bak.unlink(missing_ok=True)
         newline = "\r\n" if b"\r\n" in raw else "\n"
+        data = result.content.replace("\n", newline).encode("utf-8")
         fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
-                stream.write(result.content)
-            _copy_owner(temporary, info)
-            os.chmod(temporary, mode)
-            _copy_xattrs(target, temporary)
+            _write_temp(fd, temporary, data, info, attrs)
             # Same file, and not rewritten in place since it was read.
             if _identity(os.stat(target)) != _identity(info):
                 raise OSError(
