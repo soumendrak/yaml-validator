@@ -977,3 +977,25 @@ def test_backup_dir_is_resolved_once(tmp_path, monkeypatch):
     v.fix_file(p, backup=True)
     assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
     assert not (other / "f.yaml.bak").exists()
+
+
+def test_unchanged_file_with_unreadable_xattrs_succeeds(tmp_path, monkeypatch):
+    """No rewrite means no xattr snapshot, so unreadable xattrs don't matter."""
+    import errno
+
+    import yaml_validator.validator as v
+
+    def denied(*args):
+        raise PermissionError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(v.os, "listxattr", denied, raising=False)
+    monkeypatch.setattr(v.os, "getxattr", denied, raising=False)
+    p = write(tmp_path, "a: 1\n")
+    result = v.fix_file(p, backup=True)
+    assert result.fixed == {}
+    assert p.read_text() == "a: 1\n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+    monkeypatch.setattr(sys, "argv", ["yaml-validator", "check", "--fix", str(p)])
+    from yaml_validator.cli import main
+
+    assert main() == 0

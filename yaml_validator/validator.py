@@ -591,6 +591,17 @@ def fix_file(
         before = os.fstat(source.fileno())
         raw = source.read()
         info = os.fstat(source.fileno())
+        if _identity(before) != _identity(info):
+            # Written to while we read it: raw may mix old and new bytes.
+            raise OSError(f"{target} changed while it was being read; not fixed")
+        result = fix_content(
+            # Universal newlines, as read_text() would give.
+            raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
+            tab_width=tab_width,
+            fix_trailing_spaces=fix_trailing_spaces,
+        )
+        if not result.fixed:
+            return result  # nothing to write, so no xattr snapshot needed
         try:
             attrs = _read_xattrs(source.fileno())
         except OSError as exc:
@@ -599,37 +610,25 @@ def fix_file(
                 f"cannot read extended attributes: {exc.strerror}",
                 str(target),
             ) from exc
-    if _identity(before) != _identity(info):
-        # Written to while we read it: raw may mix old and new bytes.
-        raise OSError(f"{target} changed while it was being read; not fixed")
-    result = fix_content(
-        # Universal newlines, as read_text() would give.
-        raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
-        tab_width=tab_width,
-        fix_trailing_spaces=fix_trailing_spaces,
+    if backup:
+        # Build the new backup in a temp file, then swap it in, so a
+        # failed write leaves the previous backup intact. os.replace
+        # replaces a planted .bak symlink rather than following it.
+        # The backup is private: 0600, owned by the caller, and with no
+        # ACLs or other xattrs ({}: strip any it inherits).
+        bak_attrs = None if attrs is None else {}
+        _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
+    newline = "\r\n" if b"\r\n" in raw else "\n"
+    data = result.content.replace("\n", newline).encode("utf-8")
+
+    def unchanged() -> None:
+        # Same file, and not rewritten in place since it was read.
+        if _identity(os.stat(target)) != _identity(info):
+            raise OSError(f"{target} changed while it was being fixed; not overwritten")
+
+    _atomic_write(
+        target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged
     )
-    if result.fixed:
-        if backup:
-            # Build the new backup in a temp file, then swap it in, so a
-            # failed write leaves the previous backup intact. os.replace
-            # replaces a planted .bak symlink rather than following it.
-            # The backup is private: 0600, owned by the caller, and with no
-            # ACLs or other xattrs ({}: strip any it inherits).
-            bak_attrs = None if attrs is None else {}
-            _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
-        newline = "\r\n" if b"\r\n" in raw else "\n"
-        data = result.content.replace("\n", newline).encode("utf-8")
-
-        def unchanged() -> None:
-            # Same file, and not rewritten in place since it was read.
-            if _identity(os.stat(target)) != _identity(info):
-                raise OSError(
-                    f"{target} changed while it was being fixed; not overwritten"
-                )
-
-        _atomic_write(
-            target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged
-        )
     return result
 
 
