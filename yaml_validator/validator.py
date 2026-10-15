@@ -305,6 +305,51 @@ def _repair_tab_lines(content: str, fixers: List[LineFixer]) -> str:
     )
 
 
+def _strip_breaking_tab(line: str) -> str:
+    body = line.rstrip(" \t")
+    trail = line[len(body) :]
+    if "\t" not in trail or not body:
+        return line
+    return body + trail.replace("\t", "")
+
+
+def _repairs_to_parse(lines: List[str], edits: Dict[int, str]) -> Dict[int, str]:
+    kept = dict(edits)
+
+    def shrink(group: List[int]) -> None:
+        trial = {i: kept[i] for i in kept if i not in group}
+        if _load_all(_with_edits(lines, trial))[0]:
+            for i in group:
+                kept.pop(i, None)
+        elif len(group) > 1:
+            half = len(group) // 2
+            shrink(group[:half])
+            shrink(group[half:])
+
+    shrink(sorted(edits))
+    return kept
+
+
+def _baseline(
+    content: str, fix_tab: LineFixer, strip_tabs: bool
+) -> Tuple[bool, str, List[Any]]:
+    repaired = _repair_tab_lines(content, [fix_tab])
+    ok, data = _load_all(repaired)
+    if ok or not strip_tabs:
+        return ok, repaired if ok else content, data
+    lines = repaired.split("\n")
+    edits: Dict[int, str] = {}
+    for index, line in enumerate(lines):
+        fixed = _strip_breaking_tab(line)
+        if fixed != line:
+            edits[index] = fixed
+    if edits and _load_all(_with_edits(lines, edits))[0]:
+        chosen = _repairs_to_parse(lines, edits)
+        text = _with_edits(lines, chosen)
+        return True, text, _load_all(text)[1]
+    return False, content, []
+
+
 def _count(check: Check, content: str) -> int:
     found: List[ValidationError] = []
     check(content, "", found)
@@ -317,11 +362,12 @@ def fix_content(
     """Fix tab indentation, trailing whitespace and a missing EOF newline.
 
     A fix is kept only if the parsed data is unchanged. Content that does
-    not parse is fixed only if repairing its tab-indented lines makes it parse.
+    not parse is fixed only when a tab repair makes it parse. Trailing tabs
+    that block that parse are removed; trailing spaces are not.
     """
     fix_tab: LineFixer = partial(_fix_tab_line, tab_width=tab_width)
     checks: List[Tuple[str, Check]] = [("no-tabs", _check_tab_indentation)]
-    fixers = [fix_tab]
+    fixers: List[LineFixer] = [fix_tab]
     if fix_trailing_spaces:
         checks.append(("trailing-spaces", _check_trailing_spaces))
         fixers.append(_fix_trailing_line)
@@ -329,12 +375,8 @@ def fix_content(
     ok, data = _load_all(content)
     new = content
     reason = "file is not valid YAML, so the fix cannot be verified"
-    for depth in [] if ok else range(1, len(fixers) + 1):
-        repaired = _repair_tab_lines(content, fixers[:depth])
-        ok, data = _load_all(repaired)
-        if ok:
-            new = repaired
-            break
+    if not ok:
+        ok, new, data = _baseline(content, fix_tab, fix_trailing_spaces)
     if ok:
         new = _preserving(new, data, fixers)
         reason = "would change the parsed data"
@@ -368,7 +410,7 @@ def _xattr_names(fd: int) -> List[str]:
         raise
 
 
-def _refuse_xattrs(fd: int, target: Path) -> None:
+def _refuse_xattrs(fd: int, target: Path) -> List[str]:
     try:
         names = _xattr_names(fd)
     except OSError as exc:
@@ -382,6 +424,16 @@ def _refuse_xattrs(fd: int, target: Path) -> None:
             os.getxattr(fd, name)
         except OSError as exc:
             raise OSError(f"{target}: cannot read xattr {name} ({exc})") from exc
+    return names
+
+
+def _reject_inherited(fd: int, dest: Path, source_xattrs: List[str]) -> None:
+    owned = {name for name in source_xattrs if name.startswith("security.")}
+    for name in _xattr_names(fd):
+        if name.startswith("system.posix_acl_"):
+            raise OSError(f"{dest}: the directory's default ACL would apply")
+        if name.startswith("security.") and name not in owned:
+            raise OSError(f"{dest}: inherited security xattr {name}; not fixed")
 
 
 def _named(exc: OSError, dest: Path) -> OSError:
@@ -399,7 +451,12 @@ def _discard(path: str) -> None:
 
 
 def _write_temp(
-    dest: Path, data: bytes, info: os.stat_result, mode: int, keep_group: bool
+    dest: Path,
+    data: bytes,
+    info: os.stat_result,
+    mode: int,
+    keep_owner: bool,
+    source_xattrs: List[str],
 ) -> str:
     try:
         fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=".yaml-validator.")
@@ -410,10 +467,9 @@ def _write_temp(
             view = memoryview(data)
             while view:
                 view = view[os.write(fd, view) :]
-            if keep_group:
-                _keep_group(fd, info, dest)
-            if any(n.startswith("system.posix_acl_") for n in _xattr_names(fd)):
-                raise OSError(f"{dest}: the directory's default ACL would apply")
+            if keep_owner:
+                _keep_owner(fd, info, dest)
+            _reject_inherited(fd, dest, source_xattrs)
         finally:
             os.close(fd)
         os.chmod(temporary, mode)
@@ -423,15 +479,24 @@ def _write_temp(
     return temporary
 
 
-def _keep_group(fd: int, info: os.stat_result, dest: Path) -> None:
+def _keep_owner(fd: int, info: os.stat_result, dest: Path) -> None:
     if not hasattr(os, "fchown"):
         return
     try:
-        os.fchown(fd, -1, info.st_gid)
+        os.fchown(fd, info.st_uid, info.st_gid)
     except PermissionError as exc:
-        if os.fstat(fd).st_gid != info.st_gid:
+        current = os.fstat(fd)
+        if current.st_uid != info.st_uid:
             raise OSError(
-                errno.EPERM, "could not preserve the file's group; not fixed", str(dest)
+                errno.EPERM,
+                "could not preserve the file's owner; not fixed",
+                str(dest),
+            ) from exc
+        if current.st_gid != info.st_gid:
+            raise OSError(
+                errno.EPERM,
+                "could not preserve the file's group; not fixed",
+                str(dest),
             ) from exc
 
 
@@ -451,7 +516,9 @@ def fix_file(
 ) -> FixResult:
     """Apply :func:`fix_content` to *path* in place, via an atomic rename.
 
-    Files with POSIX ACLs, security xattrs or unreadable xattrs are refused.
+    The replacement keeps the source owner, group and mode. Files with POSIX
+    ACLs, security xattrs or unreadable xattrs are refused, as is a temp file
+    that inherits a POSIX ACL or a security xattr the source does not have.
     With ``backup=True`` the original is saved to ``<name>.bak`` at 0600.
     """
     path = Path(path)
@@ -471,14 +538,19 @@ def fix_file(
         )
         if not result.fixed:
             return result
-        _refuse_xattrs(source.fileno(), target)
+        source_xattrs = _refuse_xattrs(source.fileno(), target)
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
-    temporary = _write_temp(target, data, info, stat.S_IMODE(info.st_mode), True)
+    temporary = _write_temp(
+        target, data, info, stat.S_IMODE(info.st_mode), True, source_xattrs
+    )
     try:
         _check_unchanged(target, info)
         if backup:
-            _replace(_write_temp(bak, raw, info, 0o600, False), bak)
+            _replace(
+                _write_temp(bak, raw, info, 0o600, False, source_xattrs),
+                bak,
+            )
             _check_unchanged(target, info)
     except OSError:
         _discard(temporary)

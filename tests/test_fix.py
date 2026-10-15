@@ -212,6 +212,61 @@ def test_fix_combined_same_line_tab_and_significant_spaces():
     assert "\t" not in result.content
 
 
+def test_fix_invalid_yaml_keeps_block_scalar_spaces():
+    import yaml
+
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("msg: |\n\tx   \na:\n\tb: 1\t\n")
+    assert result.content == "msg: |\n  x   \na:\n  b: 1\n"
+    assert yaml.safe_load(result.content)["msg"] == "x   \n"
+    assert result.fixed["no-tabs"] == 2
+    assert result.fixed["trailing-spaces"] == 1
+    assert "would change the parsed data" in result.skipped["trailing-spaces"]
+
+
+def test_fix_invalid_yaml_keeps_block_scalar_trailing_tab():
+    import yaml
+
+    from yaml_validator.validator import fix_content
+
+    result = fix_content("msg: |\n\tx\t\na:\n\tb: 1\t\n")
+    assert result.content == "msg: |\n  x\t\na:\n  b: 1\n"
+    assert yaml.safe_load(result.content)["msg"] == "x\t\n"
+    mixed = fix_content("msg: |\n\tx   \t\na:\n\tb: 1\t\n")
+    assert mixed.content == "msg: |\n  x   \t\na:\n  b: 1\n"
+    assert yaml.safe_load(mixed.content)["msg"] == "x   \t\n"
+    plain = fix_content("a:\n\tb: 1\t \n")
+    assert plain.content == "a:\n  b: 1\n"
+
+
+def test_no_trailing_spaces_does_not_strip_syntax_tab():
+    from yaml_validator.validator import fix_content
+
+    text = "a:\n\tb: 1\t\n"
+    result = fix_content(text, fix_trailing_spaces=False)
+    assert result.content == text
+    assert result.fixed == {}
+
+
+def test_breaking_tab_strip_leaves_unparseable_file():
+    from yaml_validator.validator import fix_content
+
+    text = "a:\n\tb: [1, 2\t\n"
+    result = fix_content(text)
+    assert result.content == text
+    assert result.fixed == {}
+
+
+def test_strip_breaking_tab_leaves_blank_lines_and_spaces():
+    from yaml_validator.validator import _strip_breaking_tab
+
+    assert _strip_breaking_tab("\t\t") == "\t\t"
+    assert _strip_breaking_tab("  x   ") == "  x   "
+    assert _strip_breaking_tab("  b: 1\t ") == "  b: 1 "
+    assert _strip_breaking_tab("  b: 1 \t") == "  b: 1 "
+
+
 def test_fix_quiet_hides_skipped_warnings(tmp_path):
     p = write(tmp_path, "msg: |\n  keep me   \n")
     r = run("check", "--fix", "--quiet", p.name, cwd=tmp_path)
@@ -514,6 +569,94 @@ def _xattrs_supported(path):
     except (AttributeError, OSError):
         return False
     return True
+
+
+def test_fix_restores_source_owner_before_mode(tmp_path, monkeypatch):
+    """Setuid bits are applied only after the temp file has the source uid."""
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    p.chmod(0o4750)
+    before = p.stat()
+    owner = before.st_uid + 1
+    real_fstat = os.fstat
+    real_chmod = os.chmod
+    events = []
+
+    class _Owned:
+        def __init__(self, result, uid):
+            self._result = result
+            self.st_uid = uid
+
+        def __getattr__(self, name):
+            return getattr(self._result, name)
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        if result.st_ino == before.st_ino and stat.S_ISREG(result.st_mode):
+            return _Owned(result, owner)
+        return result
+
+    def fake_fchown(fd, uid, gid):
+        events.append(("fchown", uid, gid))
+
+    def fake_chmod(path, mode):
+        events.append(("chmod", stat.S_IMODE(mode)))
+        real_chmod(path, mode)
+
+    monkeypatch.setattr(v.os, "fstat", fake_fstat)
+    monkeypatch.setattr(v.os, "fchown", fake_fchown, raising=False)
+    monkeypatch.setattr(v.os, "chmod", fake_chmod)
+    v.fix_file(p, backup=True)
+    assert events[0] == ("fchown", owner, before.st_gid)
+    assert events.index(("fchown", owner, before.st_gid)) < events.index(
+        ("chmod", 0o4750)
+    )
+    assert events.count(("fchown", owner, before.st_gid)) == 1
+    assert ("chmod", 0o600) in events
+    assert p.read_text() == "a: 1\n"
+    assert stat.S_IMODE(p.stat().st_mode) == 0o4750
+    assert (tmp_path / "f.yaml.bak").read_text() == "a: 1  \n"
+
+
+def test_fix_aborts_when_source_owner_cannot_be_restored(tmp_path, monkeypatch):
+    """A chown to another uid that is not permitted must not replace the file."""
+    import yaml_validator.validator as v
+
+    p = write(tmp_path, "a: 1  \n")
+    before = p.stat()
+    foreign_uid = before.st_uid + 1
+    real_fstat = os.fstat
+
+    def fake_fstat(fd):
+        result = real_fstat(fd)
+        if result.st_ino == before.st_ino and stat.S_ISREG(result.st_mode):
+            return os.stat_result(
+                (
+                    result.st_mode,
+                    result.st_ino,
+                    result.st_dev,
+                    result.st_nlink,
+                    foreign_uid,
+                    result.st_gid,
+                )
+                + tuple(result)[6:]
+            )
+        return result
+
+    def fake_fchown(fd, uid, gid):
+        if uid != before.st_uid:
+            raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(v.os, "fstat", fake_fstat)
+    monkeypatch.setattr(v.os, "fchown", fake_fchown, raising=False)
+    with pytest.raises(OSError, match="could not preserve the file's owner") as info:
+        v.fix_file(p, backup=True)
+    assert info.value.filename == os.path.realpath(p)
+    assert p.read_text() == "a: 1  \n"
+    assert p.stat().st_uid == before.st_uid
+    assert p.stat().st_mode == before.st_mode
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
 def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
@@ -1084,6 +1227,49 @@ def test_readable_user_xattr_is_fixed(
     _fake_xattrs(monkeypatch, ["user.note"])
     fix_file(p)
     assert p.read_text() == "a: 1\n"
+
+
+@pytest.mark.parametrize(
+    "name", ["security.selinux", "security.ima", "security.capability"]
+)
+def test_inherited_security_xattr_leaves_source_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    import yaml_validator.validator as v
+
+    def listxattr(fd: int) -> list[str]:
+        listed.append(fd)
+        return ["user.note"] if len(listed) == 1 else [name]
+
+    def getxattr(fd: int, attr: str) -> bytes:
+        return b"v"
+
+    listed: list[int] = []
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v.os, "getxattr", getxattr, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match=f"inherited security xattr {name}"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_security_xattr_present_on_source_is_not_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import yaml_validator.validator as v
+
+    seen: dict[str, list[str]] = {"names": []}
+
+    def names(fd: int) -> list[str]:
+        return seen["names"]
+
+    monkeypatch.setattr(v, "_xattr_names", names)
+    seen["names"] = ["security.selinux", "user.note"]
+    v._reject_inherited(0, Path("f.yaml"), ["security.selinux"])
+    seen["names"] = ["security.selinux", "security.ima"]
+    with pytest.raises(OSError, match="inherited security xattr security.ima"):
+        v._reject_inherited(0, Path("f.yaml"), ["security.selinux"])
 
 
 def _listxattr_sequence(
