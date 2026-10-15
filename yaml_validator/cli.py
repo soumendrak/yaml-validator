@@ -7,15 +7,17 @@ Usage:
     yaml-validator --help
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from . import __version__
-from .validator import fix_file, validate_file
+from .validator import FixResult, ValidationResult, fix_file, validate_file
 
 
-def _add_fix_args(p) -> None:
+def _add_fix_args(p: argparse.ArgumentParser) -> None:
     """Add the auto-fix flags shared by ``check`` and ``lint``."""
     p.add_argument(
         "--fix",
@@ -219,7 +221,7 @@ def main() -> int:
     return exit_code
 
 
-def _print_human(result, quiet: bool = False) -> None:
+def _print_human(result: ValidationResult, quiet: bool = False) -> None:
     """Print validation result in human-readable format."""
     if result.errors:
         for err in result.errors:
@@ -236,18 +238,18 @@ def _print_human(result, quiet: bool = False) -> None:
         print(result.summary)
 
 
-def _print_fixes(path: str, fixes, quiet: bool = False) -> None:
+def _print_fixes(path: str, fixes: FixResult, quiet: bool = False) -> None:
     """Print what --fix changed and what it had to leave alone."""
     if fixes.total and not quiet:
         detail = ", ".join(f"{n} {rule}" for rule, n in fixes.fixed.items() if n)
         print(f"Fixed {fixes.total} issue(s) in {path} ({detail})")
     for rule, reason in fixes.skipped.items():
-        if quiet and rule != "no-tabs":  # --quiet: errors only, no warnings
+        if quiet and rule != "no-tabs":
             continue
         print(f"Skipped {rule} fix in {path}: {reason}")
 
 
-def _print_json(result, fixes=None) -> None:
+def _print_json(result: ValidationResult, fixes: Optional[FixResult] = None) -> None:
     """Print validation result as JSON."""
     import json
 

@@ -85,10 +85,10 @@ yaml-validator check config.yaml --fix --backup --tab-width 4
 | `end-of-file-newline` | A final newline is added |
 
 - Only whitespace is edited, so comments, quoting, key order, blank lines and CRLF line endings stay as they are.
-- A fix is applied only if it is safe. If the file parses, the parsed data must stay identical; for example, trailing spaces inside a `|` block scalar are kept. If the file does not parse, the fixes must make it parse; otherwise the file is left untouched.
+- A fix is applied only if it is safe. If the file parses, the parsed data must stay identical; for example, trailing spaces inside a `|` block scalar are kept. If the file does not parse, repairing its tab-indented lines must make it parse; otherwise the file is left untouched.
 - Running `--fix` again changes nothing.
 - The file is only rewritten when something was fixed. `--backup` saves the original as `<file>.bak` first, always at mode 0600 and owned by you.
-- The fixed file replaces the original atomically and keeps its mode, group, and best-effort extended attributes such as ACLs and SELinux labels (skipped on filesystems without xattr support; and owner, when run with the rights to set it). This breaks hard links: other names for the same file keep the old content.
+- The fixed file replaces the original atomically and keeps its mode and group. Files with POSIX ACLs, `security.*` extended attributes or unreadable extended attributes are refused and left untouched. Hard links are broken: other names keep the old content.
 
 ```bash
 $ yaml-validator check bad.yaml --fix

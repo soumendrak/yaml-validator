@@ -239,7 +239,7 @@ def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch
 
     def observe_open(path, flags, mode=0o777, **kwargs):
         fd = real_open(path, flags, mode, **kwargs)
-        if Path(path).name.startswith(".f.yaml"):  # mkstemp temp file
+        if Path(path).name.startswith(".yaml-validator."):
             excl = flags & (os.O_CREAT | os.O_EXCL) == os.O_CREAT | os.O_EXCL
             creations.append((excl, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
         return fd
@@ -1070,3 +1070,205 @@ def test_unrelated_schema_is_not_a_backup_collision(tmp_path):
     assert (tmp_path / "a.yaml.bak").read_text() == "a: 1  \n"
 
 
+
+
+def test_long_basename_is_fixed_within_name_max(tmp_path: Path) -> None:
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n", name="x" * 250 + ".yaml")
+    fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+def _fake_xattrs(
+    monkeypatch: pytest.MonkeyPatch, names: list[str], get_error: int = 0
+) -> None:
+    import yaml_validator.validator as v
+
+    calls = {"n": 0}
+
+    def listxattr(fd: int) -> list[str]:
+        calls["n"] += 1
+        return names if calls["n"] == 1 else []
+
+    def getxattr(fd: int, name: str) -> bytes:
+        if get_error:
+            raise OSError(get_error, os.strerror(get_error))
+        return b"v"
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v.os, "getxattr", getxattr, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("names", "get_error", "message"),
+    [
+        (["system.posix_acl_access"], 0, "has a POSIX ACL"),
+        (["system.posix_acl_default"], 0, "has a POSIX ACL"),
+        (["security.ima"], 0, "has a security xattr"),
+        (["security.selinux"], 0, "has a security xattr"),
+        (["user.note"], 95, "cannot read xattr user.note"),
+        (["user.note"], 5, "cannot read xattr user.note"),
+    ],
+)
+def test_fix_refuses_files_with_risky_xattrs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    names: list[str],
+    get_error: int,
+    message: str,
+) -> None:
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n")
+    _fake_xattrs(monkeypatch, names, get_error)
+    with pytest.raises(OSError, match=message) as info:
+        fix_file(p, backup=True)
+    assert "signature" not in str(info.value)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_readable_user_xattr_is_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from yaml_validator.validator import fix_file
+
+    p = write(tmp_path, "a: 1  \n")
+    _fake_xattrs(monkeypatch, ["user.note"])
+    fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+def _listxattr_sequence(
+    monkeypatch: pytest.MonkeyPatch, source: int, temp: int, temp_names: list[str]
+) -> None:
+    import yaml_validator.validator as v
+
+    calls = {"n": 0}
+
+    def listxattr(fd: int) -> list[str]:
+        calls["n"] += 1
+        err = source if calls["n"] == 1 else temp
+        if err:
+            raise OSError(err, os.strerror(err))
+        return [] if calls["n"] == 1 else temp_names
+
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v, "_XATTR_UNSUPPORTED", {95})
+
+
+@pytest.mark.parametrize(("source", "temp"), [(95, 0), (0, 95)])
+def test_unsupported_xattrs_are_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: int, temp: int
+) -> None:
+    from yaml_validator.validator import fix_file
+
+    _listxattr_sequence(monkeypatch, source, temp, [])
+    p = write(tmp_path, "a: 1  \n")
+    fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+@pytest.mark.parametrize(
+    ("source", "temp", "temp_names", "message"),
+    [
+        (5, 0, [], "cannot read extended attributes"),
+        (0, 5, [], "Input/output error"),
+        (0, 0, ["system.posix_acl_access"], "default ACL"),
+    ],
+)
+def test_xattr_failures_leave_the_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    source: int,
+    temp: int,
+    temp_names: list[str],
+    message: str,
+) -> None:
+    from yaml_validator.validator import fix_file
+
+    _listxattr_sequence(monkeypatch, source, temp, temp_names)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match=message):
+        fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+@pytest.mark.parametrize("attr", ["listxattr", "fchown"])
+def test_platform_without_the_call_is_fixed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, attr: str
+) -> None:
+    import yaml_validator.validator as v
+
+    monkeypatch.delattr(v.os, attr, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+def test_os_replace_failure_names_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml_validator.validator as v
+
+    def denied(src: str, dst: object) -> None:
+        raise PermissionError(13, "Permission denied", src)
+
+    monkeypatch.setattr(v.os, "replace", denied)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(PermissionError) as info:
+        v.fix_file(p)
+    assert info.value.filename == str(p)
+    assert str(p) in str(info.value)
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_mkstemp_failure_names_the_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml_validator.validator as v
+
+    def full(**kwargs: object) -> tuple[int, str]:
+        raise OSError(28, "No space left on device", "/tmp/x")
+
+    monkeypatch.setattr(v.tempfile, "mkstemp", full)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError) as info:
+        v.fix_file(p)
+    assert info.value.filename == str(p)
+
+
+def test_group_that_cannot_be_kept_aborts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yaml_validator.validator as v
+
+    real_fstat = os.fstat
+
+    def denied(fd: int, uid: int, gid: int) -> None:
+        raise PermissionError(1, "denied")
+
+    def other_group(fd: int) -> os.stat_result:
+        st = real_fstat(fd)
+        values = list(st)
+        values[5] = st.st_gid + 1
+        return os.stat_result(values)
+
+    def check_then_patch(target: Path, info: os.stat_result) -> None:
+        raise AssertionError("unreachable")
+
+    p = write(tmp_path, "a: 1  \n")
+    real_refuse = v._refuse_xattrs
+
+    def refuse_then_patch(fd: int, target: Path) -> None:
+        real_refuse(fd, target)
+        monkeypatch.setattr(v.os, "fstat", other_group)
+
+    monkeypatch.setattr(v.os, "fchown", denied)
+    monkeypatch.setattr(v, "_refuse_xattrs", refuse_then_patch)
+    monkeypatch.setattr(v, "_check_unchanged", check_then_patch)
+    with pytest.raises(OSError, match="could not preserve the file's group"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"

@@ -90,9 +90,10 @@ def parse_yaml(
     """
     try:
         if multi_document:
-            docs = list(yaml.safe_load_all(content))
+            docs: List[object] = list(yaml.safe_load_all(content))
             return docs
-        return yaml.safe_load(content)
+        loaded: object = yaml.safe_load(content)
+        return loaded
     except MarkedYAMLError as e:
         line = None
         column = None
@@ -403,7 +404,7 @@ def _write_temp(
     dest: Path, data: bytes, info: os.stat_result, mode: int, keep_group: bool
 ) -> str:
     try:
-        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=f".{dest.name}.")
+        fd, temporary = tempfile.mkstemp(dir=dest.parent, prefix=".yaml-validator.")
     except OSError as exc:
         raise _named(exc, dest) from exc
     try:
@@ -561,7 +562,7 @@ def validate_file(
         return result
 
     # Parse succeeded
-    if multi_document:
+    if multi_document and isinstance(parsed, list):
         result.document_count = len(parsed)
         result.data = parsed
         for doc in parsed:
