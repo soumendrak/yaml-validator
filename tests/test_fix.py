@@ -551,7 +551,8 @@ def test_fix_file_skips_xattrs_it_cannot_set(tmp_path, monkeypatch):
         raise PermissionError("no")
 
     monkeypatch.setattr(os, "setxattr", deny, raising=False)
-    fix_file(p)
+    with pytest.warns(RuntimeWarning, match="could not copy xattr security.selinux"):
+        fix_file(p)
     assert p.read_text() == "a: 1\n"
 
 
@@ -999,3 +1000,175 @@ def test_unchanged_file_with_unreadable_xattrs_succeeds(tmp_path, monkeypatch):
     from yaml_validator.cli import main
 
     assert main() == 0
+
+
+def _fake_xattrs(monkeypatch, v, source, inherited):
+    """Source has *source* xattrs; each new temp file inherits *inherited*."""
+    temps = {}
+
+    def key(fd):  # fd numbers get reused; inodes of live temps don't
+        return os.fstat(fd).st_ino
+
+    def listxattr(fd):
+        return list(temps.setdefault(key(fd), dict(inherited)))
+
+    def removexattr(fd, name):
+        temps[key(fd)].pop(name)
+
+    def setxattr(fd, name, value):
+        temps.setdefault(key(fd), dict(inherited))[name] = value
+
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: source)
+    monkeypatch.setattr(v.os, "listxattr", listxattr, raising=False)
+    monkeypatch.setattr(v.os, "removexattr", removexattr, raising=False)
+    monkeypatch.setattr(v.os, "setxattr", setxattr, raising=False)
+    return temps
+
+
+def test_acl_set_failure_aborts_without_installing_inherited_acl(tmp_path, monkeypatch):
+    import errno
+
+    import yaml_validator.validator as v
+
+    acl = "system.posix_acl_access"
+    temps = _fake_xattrs(monkeypatch, v, {acl: b"source"}, {acl: b"inherited"})
+
+    def no_space(fd, name, value):
+        assert acl not in temps[os.fstat(fd).st_ino], "inherited ACL stripped first"
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(v.os, "setxattr", no_space, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.raises(OSError, match="No space left"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_inherited_acl_is_replaced_by_the_source_acl(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    acl = "system.posix_acl_access"
+    temps = _fake_xattrs(monkeypatch, v, {acl: b"source"}, {acl: b"inherited"})
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    # The fixed file's temp (source ACL), then the .bak's ({}).
+    assert list(temps.values()) == [{acl: b"source"}, {}]
+
+
+def test_failure_stripping_non_acl_xattr_is_tolerated(tmp_path, monkeypatch):
+    """Z12: only ACL strip failures abort; others warn and continue."""
+    import yaml_validator.validator as v
+
+    _fake_xattrs(monkeypatch, v, {}, {"security.selinux": b"ctx"})
+
+    def refuse(fd, name):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(v.os, "removexattr", refuse, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.warns(RuntimeWarning, match="could not remove inherited xattr"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+def test_non_acl_setxattr_failure_warns(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    _fake_xattrs(monkeypatch, v, {"user.k": b"v"}, {})
+
+    def refuse(fd, name, value):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(v.os, "setxattr", refuse, raising=False)
+    p = write(tmp_path, "a: 1  \n")
+    with pytest.warns(RuntimeWarning, match="could not copy xattr user.k"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1\n"
+
+
+def test_other_system_xattrs_are_not_treated_as_acls(tmp_path, monkeypatch):
+    """Z14: the prefix is system.posix_acl_, not all of system.*."""
+    import yaml_validator.validator as v
+
+    temps = _fake_xattrs(monkeypatch, v, None, {"system.nfs4_acl": b"x"})
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p)
+    assert list(temps.values()) == [{"system.nfs4_acl": b"x"}]
+
+
+def test_backup_drops_inherited_non_acl_xattrs(tmp_path, monkeypatch):
+    """Z16: the .bak gets {} (strip everything), not None (strip ACLs only)."""
+    import yaml_validator.validator as v
+
+    temps = _fake_xattrs(monkeypatch, v, {}, {"user.inherited": b"x"})
+    p = write(tmp_path, "a: 1  \n")
+    v.fix_file(p, backup=True)
+    assert list(temps.values()) == [{}, {}]
+
+
+def test_identity_includes_ctime(tmp_path, monkeypatch):
+    """N11b: a same-size rewrite with mtime restored still changes ctime."""
+    import time
+
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def sneaky(*args, **kwargs):
+        st = p.stat()
+        time.sleep(0.01)
+        with open(p, "w") as stream:
+            stream.write("z: 9  \n")
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # hide mtime change
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", sneaky)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p)
+    assert p.read_text() == "z: 9  \n"
+
+
+def test_identity_includes_dev_and_inode(tmp_path, monkeypatch):
+    """N11d: a different inode with identical size and times is a change."""
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_stat = os.stat
+
+    def other_inode(path, *args, **kwargs):
+        r = real_stat(path, *args, **kwargs)
+        if str(path) == str(p):
+            fields = list(r)
+            fields[1] += 1  # st_ino
+            return os.stat_result(fields + [r.st_atime, r.st_mtime, r.st_ctime][:0])
+        return r
+
+    monkeypatch.setattr(v.os, "stat", other_inode)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"
+
+
+def test_backup_is_written_only_after_change_check(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    bak = tmp_path / "f.yaml.bak"
+    bak.write_text("previous\n")
+    real_fix_content = v.fix_content
+
+    def rewrite(*args, **kwargs):
+        with open(p, "w") as stream:
+            stream.write("newer: 1\n")
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", rewrite)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p, backup=True)
+    assert bak.read_text() == "previous\n"

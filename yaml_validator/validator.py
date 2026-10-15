@@ -12,6 +12,7 @@ import errno
 import os
 import stat
 import tempfile
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Union
@@ -446,6 +447,10 @@ _XATTR_UNSUPPORTED = {
 _ACL_PREFIX = "system.posix_acl_"
 
 
+def _warn(message: str) -> None:
+    warnings.warn(message, RuntimeWarning, stacklevel=3)
+
+
 def _apply_metadata(
     fd: int,
     path: str,
@@ -474,23 +479,26 @@ def _apply_metadata(
             if exc.errno not in _XATTR_UNSUPPORTED:
                 raise
             inherited = []  # no xattrs here, so nothing can be inherited
-        for name in inherited:  # e.g. an ACL inherited from a default ACL
-            if attrs is None:
-                # Unknown source xattrs: keep the rest, but never an ACL.
-                if not name.startswith(_ACL_PREFIX):
+        # Inherited ACLs (e.g. from a default ACL) are always stripped first;
+        # the source's own ACL, if any, is set afresh below.
+        for name in inherited:
+            if not name.startswith(_ACL_PREFIX):
+                # Unknown source xattrs (None): keep the rest.
+                if attrs is None or name in attrs:
                     continue
-            elif name in attrs:
-                continue
             try:
                 os.removexattr(fd, name)
-            except OSError:
+            except OSError as exc:
                 if name.startswith(_ACL_PREFIX):
                     raise  # an inherited ACL left in place could widen access
+                _warn(f"--fix: could not remove inherited xattr {name}: {exc}")
         for name, value in (attrs or {}).items():
             try:
                 os.setxattr(fd, name, value)
-            except OSError:
-                pass
+            except OSError as exc:
+                if name.startswith(_ACL_PREFIX):
+                    raise  # never install the file without its intended ACL
+                _warn(f"--fix: could not copy xattr {name}: {exc}")
     if hasattr(os, "fchmod"):
         os.fchmod(fd, mode)
     else:  # Windows
@@ -610,14 +618,6 @@ def fix_file(
                 f"cannot read extended attributes: {exc.strerror}",
                 str(target),
             ) from exc
-    if backup:
-        # Build the new backup in a temp file, then swap it in, so a
-        # failed write leaves the previous backup intact. os.replace
-        # replaces a planted .bak symlink rather than following it.
-        # The backup is private: 0600, owned by the caller, and with no
-        # ACLs or other xattrs ({}: strip any it inherits).
-        bak_attrs = None if attrs is None else {}
-        _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
 
@@ -625,6 +625,14 @@ def fix_file(
         # Same file, and not rewritten in place since it was read.
         if _identity(os.stat(target)) != _identity(info):
             raise OSError(f"{target} changed while it was being fixed; not overwritten")
+        if backup:
+            # Only once the source is known unchanged. Built in a temp file
+            # and swapped in, so a failed write keeps the previous backup;
+            # os.replace replaces a planted .bak symlink, not its target.
+            # The backup is private: 0600, owned by the caller, and with no
+            # ACLs or other xattrs ({}: strip any it inherits).
+            bak_attrs = None if attrs is None else {}
+            _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
 
     _atomic_write(
         target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged
