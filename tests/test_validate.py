@@ -159,3 +159,11 @@ def test_vanished_xattr_is_skipped(tmp_path, monkeypatch):
 
 def test_strip_breaking_tab_keeps_other_characters():
     assert v._strip_breaking_tab("aX \t") == "aX "
+
+
+def test_fifo_is_refused(tmp_path):
+    fifo = tmp_path / "f.yaml"
+    os.mkfifo(fifo)
+    with pytest.raises(OSError, match="not a regular file"):
+        fix_file(fifo)
+    assert fifo.is_fifo()

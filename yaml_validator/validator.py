@@ -478,6 +478,8 @@ def fix_file(
     bak = Path(os.path.realpath(path.parent)) / (path.name + ".bak")
     if backup and os.path.realpath(bak) == str(target):
         raise OSError(f"{bak} is the file being fixed; not fixed")
+    if not stat.S_ISREG(os.stat(target).st_mode):
+        raise OSError(f"{target} is not a regular file; not fixed")
     with open(target, "rb") as source:
         before = os.fstat(source.fileno())
         raw = source.read()
