@@ -425,30 +425,38 @@ def fix_file(
     ``<name>.bak`` (e.g. ``config.yaml.bak``).
     """
     path = Path(path)
-    raw = path.read_bytes()
+    # Resolve once, then read and replace that same target, so a symlink
+    # retargeted mid-run cannot redirect the write.
+    target = Path(os.path.realpath(path))
+    with open(target, "rb") as source:
+        raw = source.read()
+        info = os.fstat(source.fileno())
     result = fix_content(
-        path.read_text(encoding="utf-8"),
+        # Universal newlines, as read_text() would give.
+        raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
         tab_width=tab_width,
         fix_trailing_spaces=fix_trailing_spaces,
     )
     if result.fixed:
-        mode = stat.S_IMODE(path.stat().st_mode)
+        mode = stat.S_IMODE(info.st_mode)
         if backup:
             bak = path.with_name(path.name + ".bak")
             bak.unlink(missing_ok=True)  # Remove symlinks rather than following them.
             fd = os.open(bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as stream:
                 stream.write(raw)
-                stream.flush()
-                os.fchmod(stream.fileno(), mode)
+            os.chmod(bak, mode)
         newline = "\r\n" if b"\r\n" in raw else "\n"
-        target = Path(os.path.realpath(path))
         fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
                 stream.write(result.content)
-                stream.flush()
-                os.fchmod(stream.fileno(), mode)
+            os.chmod(temporary, mode)
+            current = os.stat(target)
+            if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                raise OSError(
+                    f"{target} changed while it was being fixed; not overwritten"
+                )
             os.replace(temporary, target)
         finally:
             Path(temporary).unlink(missing_ok=True)

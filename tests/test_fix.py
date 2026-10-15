@@ -1,9 +1,12 @@
 """Tests for ``--fix`` (issue #1)."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -377,3 +380,36 @@ def test_zero_tab_width_is_rejected(tmp_path):
     assert r.returncode == 2
     assert "--tab-width must be at least 1" in r.stderr
     assert p.read_bytes() == b"a:\n\tb: 1\n"
+
+
+def test_fix_file_does_not_need_fchmod(tmp_path, monkeypatch):
+    """Windows has no os.fchmod; --fix and --backup must still work."""
+    from yaml_validator.validator import fix_file
+
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    assert (tmp_path / "f.yaml.bak").read_text() == "a: 1  \n"
+
+
+def test_fix_file_refuses_when_target_replaced_mid_run(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fix_content = v.fix_content
+
+    def swap_then_fix(*args, **kwargs):
+        other = tmp_path / "other"
+        other.write_text("other: 2\n")
+        os.replace(other, p)
+        return real_fix_content(*args, **kwargs)
+
+    monkeypatch.setattr(v, "fix_content", swap_then_fix)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        fix_file(p)
+    assert p.read_text() == "other: 2\n"
+    assert [x.name for x in tmp_path.iterdir()] == ["f.yaml"]
