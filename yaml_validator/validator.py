@@ -621,10 +621,13 @@ def fix_file(
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
 
-    def unchanged() -> None:
+    def check() -> None:
         # Same file, and not rewritten in place since it was read.
         if _identity(os.stat(target)) != _identity(info):
             raise OSError(f"{target} changed while it was being fixed; not overwritten")
+
+    def unchanged() -> None:
+        check()
         if backup:
             # Only once the source is known unchanged. Built in a temp file
             # and swapped in, so a failed write keeps the previous backup;
@@ -633,6 +636,7 @@ def fix_file(
             # ACLs or other xattrs ({}: strip any it inherits).
             bak_attrs = None if attrs is None else {}
             _atomic_write(bak, raw, info, bak_attrs, 0o600, copy_owner=False)
+            check()  # again: the target may have changed during the backup
 
     _atomic_write(
         target, data, info, attrs, stat.S_IMODE(info.st_mode), True, unchanged

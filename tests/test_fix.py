@@ -1179,3 +1179,22 @@ def test_backup_is_written_only_after_change_check(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="changed while it was being fixed"):
         v.fix_file(p, backup=True)
     assert bak.read_text() == "previous\n"
+
+
+def test_target_rechecked_after_backup_write(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_atomic_write = v._atomic_write
+
+    def write_then_touch(dest, *args, **kwargs):
+        real_atomic_write(dest, *args, **kwargs)
+        if dest.name == "f.yaml.bak":
+            with open(p, "w") as stream:  # a writer lands during the backup
+                stream.write("newer: 1\n")
+
+    monkeypatch.setattr(v, "_atomic_write", write_then_touch)
+    with pytest.raises(OSError, match="changed while it was being fixed"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "newer: 1\n"
