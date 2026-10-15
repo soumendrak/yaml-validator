@@ -272,18 +272,9 @@ def _with_edits(lines: list[str], edits: dict[int, str]) -> str:
 def _keep_data_preserving(
     lines: list[str], edits: dict[int, str], data: list[Any]
 ) -> dict[int, str]:
-    accepted: dict[int, str] = {}
-
-    def visit(group: list[int]) -> None:
-        trial = {**accepted, **{i: edits[i] for i in group}}
-        if _parses_to(_with_edits(lines, trial), data):
-            accepted.update(trial)
-        elif len(group) > 1:
-            visit(group[: len(group) // 2])
-            visit(group[len(group) // 2 :])
-
-    visit(sorted(edits))
-    return accepted
+    inside = _block_scalar_lines("\n".join(lines))
+    kept = {i: line for i, line in edits.items() if i not in inside}
+    return kept if _parses_to(_with_edits(lines, kept), data) else {}
 
 
 def _preserving(content: str, data: list[Any], fixers: list[LineFixer]) -> str:
@@ -498,6 +489,8 @@ def fix_file(
         if not result.fixed:
             return result
         _refuse_xattrs(source.fileno(), target)
+    if info.st_nlink > 1:
+        raise OSError(f"{target} has {info.st_nlink} hard links; not fixed")
     newline = "\r\n" if b"\r\n" in raw else "\n"
     data = result.content.replace("\n", newline).encode("utf-8")
     temporary = _write_temp(target, data, info, stat.S_IMODE(info.st_mode), True)

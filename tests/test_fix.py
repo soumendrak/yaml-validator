@@ -14,13 +14,26 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 def run(*args, cwd):
-    return subprocess.run(
-        [sys.executable, "-m", "yaml_validator.cli", *args],
-        check=False,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        env={**os.environ, "PYTHONPATH": str(ROOT), "PATH": ""},
+    import contextlib
+    import io
+    import types
+
+    from yaml_validator.cli import main
+
+    out, err, old = io.StringIO(), io.StringIO(), (os.getcwd(), sys.argv)
+    os.chdir(cwd)
+    sys.argv = ["yaml-validator", *args]
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main()
+            except SystemExit as exc:
+                code = exc.code
+    finally:
+        os.chdir(old[0])
+        sys.argv = old[1]
+    return types.SimpleNamespace(
+        returncode=code, stdout=out.getvalue(), stderr=err.getvalue()
     )
 
 
@@ -187,7 +200,7 @@ def test_fix_many_lines_with_one_unsafe_is_fast():
     text = "msg: |\n  keep   \n" + body
     start = time.perf_counter()
     result = fix_content(text)
-    assert time.perf_counter() - start < 10
+    assert time.perf_counter() - start < 2
     assert result.fixed == {"trailing-spaces": 2000}
     assert "  keep   \n" in result.content
 

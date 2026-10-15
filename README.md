@@ -73,7 +73,7 @@ yaml-validator check config.yaml --fix
 
 ### Auto-fix (`--fix`)
 
-`--fix` rewrites tab indentation (`--tab-width`, default 2), trailing whitespace and a missing final newline, then validates. A fix is kept only if the parsed data is unchanged. The file is replaced atomically. Only its mode, group and owner are preserved; any other metadata is not, so files with extended attributes (`user.*`, `security.*`, POSIX ACLs) are refused. Fixing a file owned by another user requires running as that owner or as root. `--backup` saves the original as `<file>.bak` (mode 0600). A tab-indented line directly after a block scalar (`|` or `>`) becomes part of the scalar once its tab is replaced, since YAML cannot tell the two apart. With `--json`, the output gains `fixed` and `fix_skipped` keys.
+`--fix` rewrites tab indentation (`--tab-width`, default 2), trailing whitespace and a missing final newline, then validates. A fix is kept only if the parsed data is unchanged. The file is replaced atomically. Only its mode, group and owner are preserved; any other metadata is not, so files with extended attributes (`user.*`, `security.*`, POSIX ACLs) are refused, as are files with more than one hard link. Fixing a file owned by another user requires running as that owner or as root. `--backup` saves the original as `<file>.bak` (mode 0600). A tab-indented line directly after a block scalar (`|` or `>`) becomes part of the scalar once its tab is replaced, since YAML cannot tell the two apart. With `--json`, the output gains `fixed` and `fix_skipped` keys.
 
 ### Exit Codes
 
