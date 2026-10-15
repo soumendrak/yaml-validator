@@ -9,7 +9,6 @@ Provides:
 """
 
 import os
-import secrets
 import stat
 import tempfile
 from dataclasses import dataclass, field
@@ -476,22 +475,53 @@ def _apply_metadata(
         os.chmod(path, mode)
 
 
-def _write_temp(
-    fd: int, path: str, data: bytes, info: os.stat_result, attrs: Dict[str, bytes]
+def _atomic_write(
+    dest: Path,
+    data: bytes,
+    info: os.stat_result,
+    attrs: Dict[str, bytes],
+    before_replace=None,
 ) -> None:
-    """Write *data* and metadata to *fd*, close it, and check that *path*
-    still names that file."""
+    """Write *data* with the source's metadata, then rename it over *dest*.
+
+    The temp file lives in a fresh 0700 directory beside *dest*, and where
+    the platform allows, it is created and renamed through a descriptor for
+    that directory. Other users cannot swap the entry, even if they rename
+    the directory, so the inode written is the one renamed into place.
+    """
+    tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
+    # os.replace is renameat() on POSIX, like os.rename; only the latter is
+    # listed in supports_dir_fd.
+    bound = os.open in os.supports_dir_fd and os.rename in os.supports_dir_fd
+    dfd = None
+    name = "new" if bound else os.path.join(tmpdir, "new")
     try:
-        view = memoryview(data)
-        while view:
-            view = view[os.write(fd, view) :]
-        _apply_metadata(fd, path, info, attrs)
-        written = os.fstat(fd)
+        if bound:
+            dfd = os.open(tmpdir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        fd = os.open(name, flags, 0o600, dir_fd=dfd)
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            _apply_metadata(fd, os.path.join(tmpdir, "new"), info, attrs)
+        finally:
+            os.close(fd)
+        if before_replace is not None:
+            before_replace()
+        os.replace(name, dest, src_dir_fd=dfd)
     finally:
-        os.close(fd)
-    now = os.lstat(path)
-    if (now.st_dev, now.st_ino) != (written.st_dev, written.st_ino):
-        raise OSError(f"{path} was replaced while it was being written")
+        if dfd is not None or not bound:  # never a bare relative "new"
+            try:
+                os.unlink(name, dir_fd=dfd)
+            except FileNotFoundError:
+                pass
+        if dfd is not None:
+            os.close(dfd)
+        try:
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
 
 
 def fix_file(
@@ -528,29 +558,21 @@ def fix_file(
     if result.fixed:
         if backup:
             bak = path.with_name(path.name + ".bak")
-            # Build the new backup beside the old one, then swap it in, so a
+            # Build the new backup in a temp file, then swap it in, so a
             # failed write leaves the previous backup intact. os.replace
             # replaces a planted .bak symlink rather than following it.
-            tmp_bak = bak.with_name(f".{bak.name}.{secrets.token_hex(8)}.tmp")
-            fd = os.open(tmp_bak, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                _write_temp(fd, str(tmp_bak), raw, info, attrs)
-                os.replace(tmp_bak, bak)
-            finally:
-                tmp_bak.unlink(missing_ok=True)
+            _atomic_write(bak, raw, info, attrs)
         newline = "\r\n" if b"\r\n" in raw else "\n"
         data = result.content.replace("\n", newline).encode("utf-8")
-        fd, temporary = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
-        try:
-            _write_temp(fd, temporary, data, info, attrs)
+
+        def unchanged() -> None:
             # Same file, and not rewritten in place since it was read.
             if _identity(os.stat(target)) != _identity(info):
                 raise OSError(
                     f"{target} changed while it was being fixed; not overwritten"
                 )
-            os.replace(temporary, target)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+
+        _atomic_write(target, data, info, attrs, unchanged)
     return result
 
 

@@ -238,13 +238,14 @@ def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch
 
     def observe_open(path, flags, mode=0o777, **kwargs):
         fd = real_open(path, flags, mode, **kwargs)
-        if Path(path).name.startswith(".f.yaml.bak."):  # temp swapped in as .bak
+        if Path(path).name == "new":  # temp file, later renamed into place
             creations.append((flags, mode, stat.S_IMODE(os.fstat(fd).st_mode)))
         return fd
 
     monkeypatch.setattr(os, "open", observe_open)
     fix_file(p, backup=True)
-    assert creations == [(os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, 0o600)]
+    # One temp for the .bak, one for the fixed file; both start at 0600.
+    assert creations == [(os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, 0o600)] * 2
     assert bak.read_bytes() == b"a: 1  \r\n"
     assert stat.S_IMODE(bak.stat().st_mode) == 0o640
 
@@ -291,14 +292,17 @@ def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monke
     real_replace = os.replace
     calls = []
 
-    def observe_replace(src, dst):
+    def observe_replace(src, dst, **kwargs):
+        dir_fd = kwargs.get("src_dir_fd")
+        if dir_fd is not None:  # resolve the dir_fd-relative temp name
+            src = os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), src)
         src = Path(src)
         calls.append((src, dst))
-        assert src.parent == target.parent
+        assert src.parent.parent == target.parent
         assert target.read_bytes() == b"a: 1  \n"
         assert src.read_bytes() == b"a: 1\n"
         assert stat.S_IMODE(src.stat().st_mode) == 0o640
-        real_replace(src, dst)
+        real_replace(src, dst)  # the temp is renamed by full path here
 
     monkeypatch.setattr(os, "replace", observe_replace)
     fix_file(link)
@@ -319,7 +323,7 @@ def test_replace_permission_error_is_clean_and_cleans_temp(
 
     p = write(tmp_path, "a: 1  \n")
 
-    def denied(src, dst):
+    def denied(src, dst, **kwargs):
         raise PermissionError(13, "Permission denied", str(dst))
 
     monkeypatch.setattr(os, "replace", denied)
@@ -597,26 +601,32 @@ def test_fix_file_drops_xattrs_the_source_lacks(tmp_path, monkeypatch):
     assert removed == ["system.posix_acl_access"] * 2
 
 
-def test_fix_file_refuses_when_temp_entry_is_swapped(tmp_path, monkeypatch):
-    """Metadata goes through the fd; a swapped temp name aborts the replace."""
+@pytest.mark.skipif(
+    os.rename not in os.supports_dir_fd, reason="rename via dir_fd unsupported"
+)
+def test_fix_file_ignores_a_swapped_temp_directory(tmp_path, monkeypatch):
+    """Renaming the private temp dir and planting a look-alike cannot
+    redirect what gets renamed over the target."""
     import yaml_validator.validator as v
 
     p = tmp_path / "f.yaml"
     p.write_text("a: 1  \n")
     victim = tmp_path / "victim"
-    victim.write_text("keep\n")
+    victim.write_text("evil: 1\n")
     real_close = os.close
+    swapped = []
 
     def close_then_swap(fd):
         real_close(fd)
         for entry in tmp_path.iterdir():
-            if entry.name.startswith(".f.yaml."):
-                link = tmp_path / "planted"
-                link.symlink_to(victim)  # made while the temp still exists
-                os.replace(link, entry)
+            if entry.name.startswith(".yv-") and not swapped:
+                entry.rename(tmp_path / "moved")
+                entry.mkdir()
+                (entry / "new").symlink_to(victim)
+                swapped.append(entry)
 
     monkeypatch.setattr(v.os, "close", close_then_swap)
-    with pytest.raises(OSError, match="was replaced while it was being written"):
-        v.fix_file(p)
-    assert p.read_text() == "a: 1  \n"
-    assert victim.read_text() == "keep\n"
+    v.fix_file(p)
+    assert swapped
+    assert not p.is_symlink()
+    assert p.read_text() == "a: 1\n"
