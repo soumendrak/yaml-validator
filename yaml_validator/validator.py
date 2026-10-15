@@ -431,6 +431,26 @@ def _copy_owner(path: Union[str, Path], info: os.stat_result) -> None:
         pass
 
 
+def _copy_xattrs(src: Union[str, Path], dst: Union[str, Path]) -> None:
+    """Best effort: copy extended attributes, which hold POSIX ACLs
+    (``system.posix_acl_access``) and SELinux labels (``security.selinux``).
+
+    Attributes the caller may not set are skipped. No-op where the
+    platform has no xattr support.
+    """
+    if not hasattr(os, "listxattr"):
+        return
+    try:
+        names = os.listxattr(src)
+    except OSError:
+        return
+    for name in names:
+        try:
+            os.setxattr(dst, name, os.getxattr(src, name))
+        except OSError:
+            pass
+
+
 def fix_file(
     path: Union[str, Path],
     tab_width: int = 2,
@@ -444,7 +464,8 @@ def fix_file(
     ``<name>.bak`` (e.g. ``config.yaml.bak``).
 
     The fixed file is written to a temporary file and renamed over the
-    original, keeping its mode and (best effort) its owner and group.
+    original, keeping its mode and, best effort, its owner, group and extended
+    attributes (ACLs, SELinux labels).
     This breaks hard links: other names for the file keep the old content.
     """
     path = Path(path)
@@ -474,6 +495,7 @@ def fix_file(
                     stream.write(raw)
                 _copy_owner(tmp_bak, info)
                 os.chmod(tmp_bak, mode)
+                _copy_xattrs(target, tmp_bak)
                 os.replace(tmp_bak, bak)
             finally:
                 tmp_bak.unlink(missing_ok=True)
@@ -484,6 +506,7 @@ def fix_file(
                 stream.write(result.content)
             _copy_owner(temporary, info)
             os.chmod(temporary, mode)
+            _copy_xattrs(target, temporary)
             # Same file, and not rewritten in place since it was read.
             if _identity(os.stat(target)) != _identity(info):
                 raise OSError(

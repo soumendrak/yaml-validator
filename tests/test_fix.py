@@ -512,3 +512,43 @@ def test_valid_block_scalar_without_eof_newline_is_not_rewritten(tmp_path):
     assert "would change the parsed data" in result.skipped["end-of-file-newline"]
     assert p.read_bytes() == b"a: |\n  x\n  y"
     assert not (tmp_path / "f.yaml.bak").exists()
+
+
+def _xattrs_supported(path):
+    try:
+        os.setxattr(path, "user.probe", b"1")
+    except (AttributeError, OSError):
+        return False
+    return True
+
+
+def test_fix_file_keeps_extended_attributes(tmp_path):
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    if not _xattrs_supported(p):
+        pytest.skip("filesystem has no user xattr support")
+    os.setxattr(p, "user.label", b"keep-me")
+    fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    assert os.getxattr(p, "user.label") == b"keep-me"
+    assert os.getxattr(tmp_path / "f.yaml.bak", "user.label") == b"keep-me"
+
+
+def test_fix_file_skips_xattrs_it_cannot_set(tmp_path, monkeypatch):
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    monkeypatch.setattr(
+        os, "listxattr", lambda path: ["security.selinux"], raising=False
+    )
+    monkeypatch.setattr(os, "getxattr", lambda path, name: b"x", raising=False)
+
+    def deny(*args):
+        raise PermissionError("no")
+
+    monkeypatch.setattr(os, "setxattr", deny, raising=False)
+    fix_file(p)
+    assert p.read_text() == "a: 1\n"
