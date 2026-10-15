@@ -685,3 +685,59 @@ def test_backup_dir_is_bound_before_ancestor_symlink_is_retargeted(
     v.fix_file(p, backup=True)
     assert (real / "f.yaml.bak").read_text() == "a: 1  \n"
     assert not (other / "f.yaml.bak").exists()
+
+
+def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_fstat = os.fstat
+    calls = []
+
+    def fstat_then_write(fd):
+        calls.append(fd)
+        if len(calls) == 1:  # the pre-read snapshot
+            r = real_fstat(fd)
+            with open(p, "a") as stream:
+                stream.write("b: 2\n")  # a writer appends mid-read
+            return r
+        return real_fstat(fd)
+
+    monkeypatch.setattr(v.os, "fstat", fstat_then_write)
+    with pytest.raises(OSError, match="changed while it was being read"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \nb: 2\n"
+
+
+def test_incomplete_xattr_snapshot_aborts_the_fix(tmp_path, monkeypatch):
+    import yaml_validator.validator as v
+
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    monkeypatch.setattr(v, "_read_xattrs", lambda fd: None)
+    with pytest.raises(OSError, match="could not read its extended attributes"):
+        v.fix_file(p, backup=True)
+    assert p.read_text() == "a: 1  \n"
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
+
+
+def test_unbound_fallback_refuses_a_swapped_temp(tmp_path, monkeypatch):
+    """The path-based branch (e.g. Windows) re-checks the temp entry."""
+    import yaml_validator.validator as v
+
+    monkeypatch.setattr(v.os, "supports_dir_fd", set())
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    real_close = os.close
+
+    def close_then_tamper(fd):
+        real_close(fd)
+        for d in tmp_path.iterdir():
+            if d.name.startswith(".yv-") and (d / "new").exists():
+                (d / "new").write_bytes(b"evil: 1\n")
+
+    monkeypatch.setattr(v.os, "close", close_then_tamper)
+    with pytest.raises(OSError, match="while it was being written"):
+        v.fix_file(p)
+    assert p.read_text() == "a: 1  \n"

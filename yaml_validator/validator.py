@@ -497,9 +497,20 @@ def _atomic_write(
         tmpdir = tempfile.mkdtemp(dir=dest.parent, prefix=".yv-")
         name = os.path.join(tmpdir, "new")
         try:
-            _write_new(os.open(name, _NEW_FLAGS, 0o600), name, data, info, attrs)
+            fd = os.open(name, _NEW_FLAGS, 0o600)
+            written = os.fstat(fd)
+            _write_new(fd, name, data, info, attrs)
             if before_replace is not None:
                 before_replace()
+            # Where mode 0o700 may not make the directory private (Windows
+            # before Python 3.13), check the entry is still the file we
+            # wrote, with our bytes, right before the rename.
+            now = os.lstat(name)
+            if (now.st_dev, now.st_ino) != (written.st_dev, written.st_ino):
+                raise OSError(f"{name} was replaced while it was being written")
+            with open(name, "rb") as check:
+                if check.read() != data:
+                    raise OSError(f"{name} was modified while it was being written")
             os.replace(name, dest)
         finally:
             Path(name).unlink(missing_ok=True)
@@ -579,9 +590,17 @@ def fix_file(
     # retargeted mid-run cannot redirect the write.
     target = Path(os.path.realpath(path))
     with open(target, "rb") as source:
+        before = os.fstat(source.fileno())
         raw = source.read()
         info = os.fstat(source.fileno())
         attrs = _read_xattrs(source.fileno())
+    if _identity(before) != _identity(info):
+        # Written to while we read it: raw may mix old and new bytes.
+        raise OSError(f"{target} changed while it was being read; not fixed")
+    if attrs is None:
+        # Without a full snapshot we cannot tell the source's ACLs from ones
+        # the temp file inherits, so do not risk installing the wrong ones.
+        raise OSError(f"{target}: could not read its extended attributes; not fixed")
     result = fix_content(
         # Universal newlines, as read_text() would give.
         raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n"),
