@@ -463,3 +463,52 @@ def test_failed_backup_write_keeps_old_backup(tmp_path, monkeypatch):
     assert bak.read_text() == "old backup\n"
     assert p.read_text() == "a: 1  \n"
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml", "f.yaml.bak"]
+
+
+def _secondary_group():
+    gids = (
+        [g for g in os.getgroups() if g != os.getgid()]
+        if hasattr(os, "getgroups")
+        else []
+    )
+    return gids[0] if gids else None
+
+
+@pytest.mark.skipif(_secondary_group() is None, reason="user has no secondary group")
+def test_fix_file_keeps_group_on_file_and_backup(tmp_path):
+    from yaml_validator.validator import fix_file
+
+    gid = _secondary_group()
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    os.chown(p, -1, gid)
+    fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+    assert p.stat().st_gid == gid
+    assert (tmp_path / "f.yaml.bak").stat().st_gid == gid
+
+
+def test_fix_file_ignores_permission_error_from_chown(tmp_path, monkeypatch):
+    from yaml_validator.validator import fix_file
+
+    def deny(*args, **kwargs):
+        raise PermissionError("not root")
+
+    monkeypatch.setattr(os, "chown", deny, raising=False)
+    p = tmp_path / "f.yaml"
+    p.write_text("a: 1  \n")
+    fix_file(p, backup=True)
+    assert p.read_text() == "a: 1\n"
+
+
+def test_valid_block_scalar_without_eof_newline_is_not_rewritten(tmp_path):
+    """M3: adding the EOF newline would change the scalar's data."""
+    from yaml_validator.validator import fix_file
+
+    p = tmp_path / "f.yaml"
+    p.write_bytes(b"a: |\n  x\n  y")
+    result = fix_file(p, backup=True)
+    assert result.fixed == {}
+    assert "would change the parsed data" in result.skipped["end-of-file-newline"]
+    assert p.read_bytes() == b"a: |\n  x\n  y"
+    assert not (tmp_path / "f.yaml.bak").exists()

@@ -88,6 +88,7 @@ yaml-validator check config.yaml --fix --backup --tab-width 4
 - A fix is applied only if it is safe. If the file parses, the parsed data must stay identical; for example, trailing spaces inside a `|` block scalar are kept. If the file does not parse, the fixes must make it parse; otherwise the file is left untouched.
 - Running `--fix` again changes nothing.
 - The file is only rewritten when something was fixed. `--backup` saves the original as `<file>.bak` first.
+- The fixed file replaces the original atomically and keeps its mode and group (and owner, when run with the rights to set it). This breaks hard links: other names for the same file keep the old content.
 
 ```bash
 $ yaml-validator check bad.yaml --fix

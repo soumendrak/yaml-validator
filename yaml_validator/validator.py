@@ -417,6 +417,20 @@ def _identity(st: os.stat_result) -> tuple:
     return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
 
 
+def _copy_owner(path: Union[str, Path], info: os.stat_result) -> None:
+    """Best effort: give *path* the source's owner and group.
+
+    An unprivileged user can still set any group they belong to; changing
+    the owner needs root, so a PermissionError is ignored.
+    """
+    if not hasattr(os, "chown"):  # Windows
+        return
+    try:
+        os.chown(path, info.st_uid, info.st_gid)
+    except PermissionError:
+        pass
+
+
 def fix_file(
     path: Union[str, Path],
     tab_width: int = 2,
@@ -428,6 +442,10 @@ def fix_file(
     The file is only rewritten if something was fixed. CRLF line endings
     are kept. With ``backup=True`` the original bytes are first saved to
     ``<name>.bak`` (e.g. ``config.yaml.bak``).
+
+    The fixed file is written to a temporary file and renamed over the
+    original, keeping its mode and (best effort) its owner and group.
+    This breaks hard links: other names for the file keep the old content.
     """
     path = Path(path)
     # Resolve once, then read and replace that same target, so a symlink
@@ -454,6 +472,7 @@ def fix_file(
             try:
                 with os.fdopen(fd, "wb") as stream:
                     stream.write(raw)
+                _copy_owner(tmp_bak, info)
                 os.chmod(tmp_bak, mode)
                 os.replace(tmp_bak, bak)
             finally:
@@ -463,6 +482,7 @@ def fix_file(
         try:
             with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as stream:
                 stream.write(result.content)
+            _copy_owner(temporary, info)
             os.chmod(temporary, mode)
             # Same file, and not rewritten in place since it was read.
             if _identity(os.stat(target)) != _identity(info):
