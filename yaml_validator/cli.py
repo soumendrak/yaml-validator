@@ -18,27 +18,15 @@ from .validator import FixResult, ValidationResult, fix_file, validate_file
 
 
 def _add_fix_args(p: argparse.ArgumentParser) -> None:
-    """Add the auto-fix flags shared by ``check`` and ``lint``."""
     p.add_argument(
         "--fix",
         "-f",
         action="store_true",
-        default=False,
-        help="Fix tab indentation, trailing whitespace and a missing EOF newline "
-        "in place, then validate. Fixes that would change the parsed data are "
-        "skipped. Exits 1 if the file is still invalid.",
+        help="Fix tabs, trailing spaces and a missing EOF newline, then validate.",
     )
+    p.add_argument("--backup", action="store_true", help="With --fix, keep <file>.bak.")
     p.add_argument(
-        "--backup",
-        action="store_true",
-        default=False,
-        help="With --fix, save the original as <file>.bak before rewriting it.",
-    )
-    p.add_argument(
-        "--tab-width",
-        type=int,
-        default=2,
-        help="Spaces per indentation tab when fixing (default: 2).",
+        "--tab-width", type=int, default=2, help="Spaces per tab (default: 2)."
     )
 
 
@@ -161,9 +149,6 @@ def main() -> int:
     exit_code = 0
 
     if args.fix and args.backup:
-        # A .bak must not land on another input or the schema (e.g. a.yaml
-        # and a.yaml.bak both given, or --schema a.yaml.bak): that file
-        # would be overwritten before it is read.
         protected = {os.path.realpath(f) for f in args.files}
         schema = getattr(args, "schema", None)
         if schema:
@@ -184,28 +169,28 @@ def main() -> int:
             exit_code = 1
             continue
 
-        try:
-            fixes = None
-            if args.fix:
+        fixes: Optional[FixResult] = None
+        if args.fix:
+            try:
                 fixes = fix_file(
                     p,
                     tab_width=args.tab_width,
                     fix_trailing_spaces=getattr(args, "check_trailing_spaces", True),
                     backup=args.backup,
                 )
+            except OSError as exc:
+                print(f"Error: {p}: {exc}", file=sys.stderr)
+                exit_code = 1
+                continue
 
-            result = validate_file(
-                path=p,
-                schema_path=args.schema if getattr(args, "schema", None) else None,
-                multi_document=args.multi,
-                check_line_length=getattr(args, "check_line_length", True),
-                check_trailing_spaces=getattr(args, "check_trailing_spaces", True),
-                max_line_length=getattr(args, "max_line_length", 200),
-            )
-        except OSError as exc:
-            print(f"Error: {p}: {exc}", file=sys.stderr)
-            exit_code = 1
-            continue
+        result = validate_file(
+            path=p,
+            schema_path=args.schema if getattr(args, "schema", None) else None,
+            multi_document=args.multi,
+            check_line_length=getattr(args, "check_line_length", True),
+            check_trailing_spaces=getattr(args, "check_trailing_spaces", True),
+            max_line_length=getattr(args, "max_line_length", 200),
+        )
 
         all_results.append(result)
         if not result.is_valid:
@@ -239,7 +224,6 @@ def _print_human(result: ValidationResult, quiet: bool = False) -> None:
 
 
 def _print_fixes(path: str, fixes: FixResult, quiet: bool = False) -> None:
-    """Print what --fix changed and what it had to leave alone."""
     if fixes.total and not quiet:
         detail = ", ".join(f"{n} {rule}" for rule, n in fixes.fixed.items() if n)
         print(f"Fixed {fixes.total} issue(s) in {path} ({detail})")

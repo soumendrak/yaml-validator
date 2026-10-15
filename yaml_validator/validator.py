@@ -13,13 +13,12 @@ import os
 import stat
 import tempfile
 from dataclasses import dataclass, field
-from functools import reduce
+from functools import partial, reduce
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import yaml
 from yaml.error import MarkedYAMLError
-
 
 # ── Types ────────────────────────────────────────────────────────────────────
 
@@ -214,9 +213,6 @@ def _detect_tab_vs_space(
             _detect_tab_vs_space(item, errors, f"{path}[{i}]")
 
 
-# ── Auto-fix ────────────────────────────────────────────────────────────────
-
-
 @dataclass
 class FixResult:
     """Outcome of auto-fixing one file's content."""
@@ -276,7 +272,6 @@ def _with_edits(lines: List[str], edits: Dict[int, str]) -> str:
 def _keep_data_preserving(
     lines: List[str], edits: Dict[int, str], data: List[Any]
 ) -> Dict[int, str]:
-    """Bisect *edits* down to those that keep the parsed data equal to *data*."""
     accepted: Dict[int, str] = {}
 
     def visit(group: List[int]) -> None:
@@ -324,7 +319,7 @@ def fix_content(
     A fix is kept only if the parsed data is unchanged. Content that does
     not parse is fixed only if repairing its tab-indented lines makes it parse.
     """
-    fix_tab: LineFixer = lambda line: _fix_tab_line(line, tab_width)  # noqa: E731
+    fix_tab: LineFixer = partial(_fix_tab_line, tab_width=tab_width)
     checks: List[Tuple[str, Check]] = [("no-tabs", _check_tab_indentation)]
     fixers = [fix_tab]
     if fix_trailing_spaces:
@@ -362,17 +357,22 @@ _XATTR_UNSUPPORTED = {
 }
 
 
-def _refuse_xattrs(fd: int, target: Path) -> None:
+def _xattr_names(fd: int) -> List[str]:
     if not hasattr(os, "listxattr"):
-        return
+        return []
     try:
-        names = os.listxattr(fd)
+        return os.listxattr(fd)
     except OSError as exc:
         if exc.errno in _XATTR_UNSUPPORTED:
-            return
-        raise OSError(
-            f"{target}: cannot read extended attributes ({exc}); not fixed"
-        ) from exc
+            return []
+        raise
+
+
+def _refuse_xattrs(fd: int, target: Path) -> None:
+    try:
+        names = _xattr_names(fd)
+    except OSError as exc:
+        raise OSError(f"{target}: cannot read extended attributes ({exc})") from exc
     for name in names:
         if name.startswith("system.posix_acl_"):
             raise OSError(f"{target} has a POSIX ACL ({name}); not fixed")
@@ -381,9 +381,7 @@ def _refuse_xattrs(fd: int, target: Path) -> None:
         try:
             os.getxattr(fd, name)
         except OSError as exc:
-            raise OSError(
-                f"{target}: cannot read xattr {name} ({exc}); not fixed"
-            ) from exc
+            raise OSError(f"{target}: cannot read xattr {name} ({exc})") from exc
 
 
 def _named(exc: OSError, dest: Path) -> OSError:
@@ -414,7 +412,8 @@ def _write_temp(
                 view = view[os.write(fd, view) :]
             if keep_group:
                 _keep_group(fd, info, dest)
-            _refuse_inherited_acl(fd, dest)
+            if any(n.startswith("system.posix_acl_") for n in _xattr_names(fd)):
+                raise OSError(f"{dest}: the directory's default ACL would apply")
         finally:
             os.close(fd)
         os.chmod(temporary, mode)
@@ -434,19 +433,6 @@ def _keep_group(fd: int, info: os.stat_result, dest: Path) -> None:
             raise OSError(
                 errno.EPERM, "could not preserve the file's group; not fixed", str(dest)
             ) from exc
-
-
-def _refuse_inherited_acl(fd: int, dest: Path) -> None:
-    if not hasattr(os, "listxattr"):
-        return
-    try:
-        names = os.listxattr(fd)
-    except OSError as exc:
-        if exc.errno in _XATTR_UNSUPPORTED:
-            return
-        raise
-    if any(name.startswith("system.posix_acl_") for name in names):
-        raise OSError(f"{dest}: the directory's default ACL would apply; not fixed")
 
 
 def _replace(temporary: str, dest: Path) -> None:

@@ -19,7 +19,7 @@ def run(*args, cwd):
         cwd=cwd,
         capture_output=True,
         text=True,
-        env={"PYTHONPATH": str(ROOT), "PATH": ""},
+        env={**os.environ, "PYTHONPATH": str(ROOT), "PATH": ""},
     )
 
 
@@ -61,7 +61,6 @@ def test_fix_missing_eof_newline(tmp_path):
 
 
 def test_fix_tabs_and_trailing_tab_together(tmp_path):
-    # Neither fix alone makes this parse (PyYAML rejects the trailing tab too).
     p = write(tmp_path, "a:\n\tb: 1\t\n")
     r = run("lint", "--fix", p.name, cwd=tmp_path)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -76,7 +75,6 @@ def test_fix_keeps_crlf_line_endings(tmp_path):
 
 
 def test_fix_skips_block_scalar_trailing_spaces(tmp_path):
-    # Trailing spaces inside a literal block are data; only the safe line changes.
     p = write(tmp_path, "msg: |\n  keep me   \nother: 1  \n")
     r = run("check", "--fix", p.name, cwd=tmp_path)
     assert p.read_text() == "msg: |\n  keep me   \nother: 1\n"
@@ -84,7 +82,7 @@ def test_fix_skips_block_scalar_trailing_spaces(tmp_path):
         "Skipped trailing-spaces fix in f.yaml: 1 not fixed: would change the parsed data"
         in r.stdout
     )
-    assert r.returncode == 0  # only a warning is left
+    assert r.returncode == 0
 
 
 def test_fix_backup(tmp_path):
@@ -125,15 +123,13 @@ def test_fix_unfixable_error_exits_nonzero_and_leaves_file(tmp_path):
     p = write(tmp_path, original)
     r = run("check", "--fix", p.name, cwd=tmp_path)
     assert r.returncode == 1
-    assert p.read_text() == original  # cannot verify fixes on unparseable YAML
+    assert p.read_text() == original
     assert "Skipped trailing-spaces fix in f.yaml" in r.stdout
     assert "[ERROR]" in r.stdout
     assert not (tmp_path / "f.yaml.bak").exists()
 
 
 def test_fix_unfixable_tab_exits_nonzero(tmp_path):
-    # The tab fix cannot make this parse (the bracket is never closed), so it
-    # is not applied and the tab error is still reported.
     original = "a:\n\tb: [1, 2\n"
     p = write(tmp_path, original)
     r = run("check", "--fix", p.name, cwd=tmp_path)
@@ -153,8 +149,6 @@ def test_fix_json_reports_fixes(tmp_path):
 
 
 def test_fix_combined_keeps_block_scalar_spaces(tmp_path):
-    # Tab + trailing-tab fixes are needed together to parse; the block
-    # scalar's significant trailing spaces must survive that combined pass.
     p = write(tmp_path, "msg: |\n  keep   \na:\n\tb: 1\t\n")
     r = run("check", "--fix", p.name, cwd=tmp_path)
     assert p.read_text() == "msg: |\n  keep   \na:\n  b: 1\n"
@@ -246,10 +240,8 @@ def test_backup_created_private_before_source_mode_applied(tmp_path, monkeypatch
 
     monkeypatch.setattr(os, "open", observe_open)
     fix_file(p, backup=True)
-    # One temp for the .bak, one for the fixed file; both start at 0600.
     assert creations == [(True, 0o600, 0o600)] * 2
     assert bak.read_bytes() == b"a: 1  \r\n"
-    # The backup stays private (0600) even though the source is 0640.
     assert stat.S_IMODE(bak.stat().st_mode) == 0o600
     assert stat.S_IMODE(p.stat().st_mode) == 0o640
 
@@ -298,7 +290,7 @@ def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monke
 
     def observe_replace(src, dst, **kwargs):
         dir_fd = kwargs.get("src_dir_fd")
-        if dir_fd is not None:  # resolve the dir_fd-relative temp name
+        if dir_fd is not None:
             src = os.path.join(os.readlink(f"/proc/self/fd/{dir_fd}"), src)
         if kwargs.get("dst_dir_fd") is not None:
             dst = Path(os.readlink(f"/proc/self/fd/{kwargs['dst_dir_fd']}")) / dst
@@ -308,7 +300,7 @@ def test_fix_atomically_replaces_resolved_target_preserving_mode(tmp_path, monke
         assert target.read_bytes() == b"a: 1  \n"
         assert src.read_bytes() == b"a: 1\n"
         assert stat.S_IMODE(src.stat().st_mode) == 0o640
-        real_replace(src, dst)  # the temp is renamed by full path here
+        real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", observe_replace)
     fix_file(link)
@@ -434,7 +426,7 @@ def test_fix_file_refuses_when_target_rewritten_in_place(tmp_path, monkeypatch):
     real_fix_content = v.fix_content
 
     def rewrite_then_fix(*args, **kwargs):
-        with open(p, "w") as stream:  # same inode, new contents
+        with open(p, "w") as stream:
             stream.write("newer: 3\n")
         return real_fix_content(*args, **kwargs)
 
@@ -484,7 +476,6 @@ def test_fix_file_keeps_group_on_file_not_backup(tmp_path):
     fix_file(p, backup=True)
     assert p.read_text() == "a: 1\n"
     assert p.stat().st_gid == gid
-    # The backup is not chowned: it keeps the caller's own group.
     assert (tmp_path / "f.yaml.bak").stat().st_gid == os.getgid()
 
 
@@ -525,12 +516,6 @@ def _xattrs_supported(path):
     return True
 
 
-
-
-
-
-
-
 def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
     """Caller owns the file but cannot set its group onto the replacement.
 
@@ -568,8 +553,6 @@ def test_fix_aborts_when_source_group_cannot_be_restored(tmp_path, monkeypatch):
     assert sorted(x.name for x in tmp_path.iterdir()) == ["f.yaml"]
 
 
-
-
 def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
     import yaml_validator.validator as v
 
@@ -580,10 +563,10 @@ def test_source_rewritten_during_read_is_not_fixed(tmp_path, monkeypatch):
 
     def fstat_then_write(fd):
         calls.append(fd)
-        if len(calls) == 1:  # the pre-read snapshot
+        if len(calls) == 1:
             r = real_fstat(fd)
             with open(p, "a") as stream:
-                stream.write("b: 2\n")  # a writer appends mid-read
+                stream.write("b: 2\n")
             return r
         return real_fstat(fd)
 
@@ -603,8 +586,6 @@ def test_backup_is_0600_even_for_world_readable_source(tmp_path):
     fix_file(p, backup=True)
     assert stat.S_IMODE((tmp_path / "f.yaml.bak").stat().st_mode) == 0o600
     assert stat.S_IMODE(p.stat().st_mode) == 0o644
-
-
 
 
 def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatch):
@@ -629,14 +610,6 @@ def test_read_only_directory_error_names_the_target(tmp_path, capsys, monkeypatc
     assert p.read_text() == "a: 1  \n"
 
 
-
-
-
-
-
-
-
-
 def _have_setfacl(path):
     import shutil
 
@@ -646,10 +619,6 @@ def _have_setfacl(path):
         ["setfacl", "-m", "u:nobody:r", str(path)], capture_output=True
     )
     return probe.returncode == 0
-
-
-
-
 
 
 def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
@@ -666,8 +635,6 @@ def test_fchown_other_oserror_is_not_swallowed(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="I/O error"):
         v.fix_file(p)
     assert p.read_text() == "a: 1  \n"
-
-
 
 
 def test_windows_chmod_fallback_sets_mode(tmp_path, monkeypatch):
@@ -754,7 +721,7 @@ def test_same_size_rewrite_is_detected(tmp_path, monkeypatch):
 
     def rewrite_same_size(*args, **kwargs):
         with open(p, "w") as stream:
-            stream.write("z: 9  \n")  # same length, same inode
+            stream.write("z: 9  \n")
         st = p.stat()
         os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
         return real_fix_content(*args, **kwargs)
@@ -790,13 +757,11 @@ def test_backup_dir_is_resolved_once(tmp_path, monkeypatch):
     assert not (other / "f.yaml.bak").exists()
 
 
-
-
 def _fake_xattrs(monkeypatch, v, source, inherited):
     """Source has *source* xattrs; each new temp file inherits *inherited*."""
     temps = {}
 
-    def key(fd):  # fd numbers get reused; inodes of live temps don't
+    def key(fd):
         return os.fstat(fd).st_ino
 
     def listxattr(fd):
@@ -815,18 +780,6 @@ def _fake_xattrs(monkeypatch, v, source, inherited):
     return temps
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def test_identity_includes_ctime(tmp_path, monkeypatch):
     """N11b: a same-size rewrite with mtime restored still changes ctime."""
     import time
@@ -842,7 +795,7 @@ def test_identity_includes_ctime(tmp_path, monkeypatch):
         time.sleep(0.01)
         with open(p, "w") as stream:
             stream.write("z: 9  \n")
-        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))  # hide mtime change
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
         return real_fix_content(*args, **kwargs)
 
     monkeypatch.setattr(v, "fix_content", sneaky)
@@ -930,7 +883,7 @@ def test_backup_enospc_names_the_bak(tmp_path, monkeypatch):
 
     def full_on_second(fd, data):
         calls["n"] += 1
-        if calls["n"] == 2:  # first write is the fixed temp, second the .bak
+        if calls["n"] == 2:
             raise OSError(errno.ENOSPC, "No space left on device")
         return real_write(fd, data)
 
@@ -981,10 +934,6 @@ def test_backup_is_written_beside_the_symlink(tmp_path):
     assert sorted(x.name for x in real.iterdir()) == ["t.yaml"]
 
 
-
-
-
-
 def test_backup_aliasing_the_target_is_refused(tmp_path):
     from yaml_validator.validator import fix_file
 
@@ -1024,7 +973,6 @@ def test_backup_onto_schema_is_refused(tmp_path):
     assert r.returncode == 1
     assert "would overwrite an input or schema file" in r.stderr
     assert "a.yaml.bak" in r.stderr
-    # Nothing is written, including an earlier input whose .bak is free.
     assert earlier.read_text() == "z: 1  \n"
     assert a.read_text() == "a: 1  \n"
     assert schema.read_text() == "type: object\n"
@@ -1068,8 +1016,6 @@ def test_unrelated_schema_is_not_a_backup_collision(tmp_path):
     assert a.read_text() == "a: 1\n"
     assert schema.read_text() == "type: object\n"
     assert (tmp_path / "a.yaml.bak").read_text() == "a: 1  \n"
-
-
 
 
 def test_long_basename_is_fixed_within_name_max(tmp_path: Path) -> None:
@@ -1272,3 +1218,37 @@ def test_group_that_cannot_be_kept_aborts(
     with pytest.raises(OSError, match="could not preserve the file's group"):
         v.fix_file(p)
     assert p.read_text() == "a: 1  \n"
+
+
+def test_multi_document_files_are_counted(tmp_path: Path) -> None:
+    from yaml_validator.validator import validate_file
+
+    p = write(tmp_path, "a: 1\n---\nb: 2\n")
+    assert validate_file(p, multi_document=True).document_count == 2
+
+
+def test_unrepresentable_data_is_not_the_same() -> None:
+    from yaml_validator.validator import _same_data
+
+    assert not _same_data([object()], [object()])
+
+
+def test_cli_reports_fix_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import yaml_validator.cli as cli
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise OSError("disk on fire")
+
+    p = write(tmp_path, "a: 1  \n")
+    monkeypatch.setattr(cli, "fix_file", broken)
+    monkeypatch.setattr(sys, "argv", ["yaml-validator", "check", "--fix", str(p)])
+    assert cli.main() == 1
+    assert f"Error: {p}: disk on fire" in capsys.readouterr().err
+
+
+def test_cli_missing_file_is_an_error(tmp_path: Path) -> None:
+    r = run("check", "--fix", "missing.yaml", cwd=tmp_path)
+    assert r.returncode == 1
+    assert "file not found" in r.stderr

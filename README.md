@@ -69,34 +69,11 @@ yaml-validator lint config.yaml
 
 # Auto-fix style issues in place, then validate
 yaml-validator check config.yaml --fix
-
-# Keep a copy of the original as config.yaml.bak; indent tabs become 4 spaces
-yaml-validator check config.yaml --fix --backup --tab-width 4
 ```
 
 ### Auto-fix (`--fix`)
 
-`--fix` (or `-f`, on `check` and `lint`) rewrites each file in place, then validates it and reports what is left:
-
-| Rule | Fix |
-|------|-----|
-| `no-tabs` | Tabs in the indentation of tab-indented lines become `--tab-width` spaces (default 2) |
-| `trailing-spaces` | Trailing whitespace is removed (skipped with `--no-trailing-spaces`) |
-| `end-of-file-newline` | A final newline is added |
-
-- Only whitespace is edited, so comments, quoting, key order, blank lines and CRLF line endings stay as they are.
-- A fix is applied only if it is safe. If the file parses, the parsed data must stay identical; for example, trailing spaces inside a `|` block scalar are kept. If the file does not parse, repairing its tab-indented lines must make it parse; otherwise the file is left untouched.
-- Running `--fix` again changes nothing.
-- The file is only rewritten when something was fixed. `--backup` saves the original as `<file>.bak` first, always at mode 0600 and owned by you.
-- The fixed file replaces the original atomically and keeps its mode and group. Files with POSIX ACLs, `security.*` extended attributes or unreadable extended attributes are refused and left untouched. Hard links are broken: other names keep the old content.
-
-```bash
-$ yaml-validator check bad.yaml --fix
-Fixed 1 issue(s) in bad.yaml (1 no-tabs)
-✓ bad.yaml
-```
-
-Fixes that were skipped are listed with the reason (`Skipped trailing-spaces fix in x.yaml: ...`). With `--json`, the output gains `fixed` and `fix_skipped` keys.
+`--fix` rewrites tab indentation (`--tab-width`, default 2), trailing whitespace and a missing final newline, then validates. A fix is kept only if the parsed data is unchanged. The file is replaced atomically, keeping its mode and group; `--backup` saves the original as `<file>.bak` (mode 0600). Files with POSIX ACLs, `security.*` or unreadable extended attributes are refused. With `--json`, the output gains `fixed` and `fix_skipped` keys.
 
 ### Exit Codes
 
