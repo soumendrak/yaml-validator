@@ -167,3 +167,12 @@ def test_fifo_is_refused(tmp_path):
     with pytest.raises(OSError, match="not a regular file"):
         fix_file(fifo)
     assert fifo.is_fifo()
+
+
+def test_non_utf8_file_returns_io_error(tmp_path):
+    p = tmp_path / "latin1.yaml"
+    p.write_bytes(b"key: caf\xe9\n")
+    result = validate_file(p)
+    assert not result.is_valid
+    assert result.errors and result.errors[0].rule == "io"
+    assert "UTF-8" in result.errors[0].message
