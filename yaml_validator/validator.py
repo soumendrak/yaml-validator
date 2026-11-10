@@ -545,7 +545,18 @@ def validate_file(
             errors=[ValidationError(message=f"File not found: {path}", rule="io")],
         )
 
-    content = path.read_text(encoding="utf-8")
+    try:
+        content = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        return ValidationResult(
+            path=str(path),
+            is_valid=False,
+            errors=[
+                ValidationError(
+                    message=f"File is not valid UTF-8: {path}", rule="io"
+                )
+            ],
+        )
     result = ValidationResult(path=str(path), is_valid=True, document_count=0)
 
     warnings: list[ValidationError] = []
